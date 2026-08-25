@@ -1,0 +1,31 @@
+{
+  "schema": "contextbench.demo-judgments.v1",
+  "cases": [
+    {
+      "query": "What happens when a Raft follower falls behind the leader?",
+      "relevantMarkers": ["moves that follower's `nextIndex` backward", "sends an InstallSnapshot call"],
+      "notes": "Tests log backtracking and snapshot catch-up."
+    },
+    {
+      "query": "Why must a database write the log before a dirty page?",
+      "relevantMarkers": ["log sequence number for a page change must be durable"],
+      "notes": "Tests exact lexical and semantic retrieval for write-ahead logging."
+    },
+    {
+      "query": "How does TCP keep a slow receiver from being overwhelmed?",
+      "relevantMarkers": ["TCP flow control protects the receiver"],
+      "notes": "Separates receiver flow control from congestion control."
+    },
+    {
+      "query": "Why can a long database transaction increase disk use?",
+      "relevantMarkers": ["A long-running transaction delays that cleanup"],
+      "notes": "Tests MVCC vocabulary and causal wording."
+    },
+    {
+      "query": "How can a service avoid duplicate resources when POST is retried?",
+      "relevantMarkers": ["An idempotency key lets a server recognize repeated POST attempts"],
+      "notes": "Tests source diversity and a phrase absent from the question."
+    }
+  ]
+}
+
