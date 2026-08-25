@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "contextbench"
+version = "1.0.0"
+description = "Local-first RAG retrieval evaluation workbench"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Mateo Osorio Delhonte" }]
+keywords = ["rag", "retrieval", "evaluation", "bm25", "qdrant"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "fastapi>=0.141.1,<0.142",
+  "httpx>=0.28.1,<0.29",
+  "pydantic>=2.13.4,<3",
+  "pydantic-settings>=2.10,<3",
+  "pypdf>=6.16.2,<7",
+  "python-multipart>=0.0.20,<0.1",
+  "qdrant-client>=1.19,<2",
+  "sqlalchemy>=2.0.52,<3",
+  "typer>=0.27.1,<0.28",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+ml = ["sentence-transformers>=5.7,<7"]
+dev = [
+  "build>=1.3,<2",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+  "pytest-cov>=6.2,<7",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+contextbench = "contextbench.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/contextbench"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+markers = ["real_model: downloads and runs the configured local ML model"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "S"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["contextbench"]
+plugins = ["pydantic.mypy"]
+
