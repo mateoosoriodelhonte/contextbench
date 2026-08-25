@@ -144,6 +144,7 @@ export interface RetrievalResponse {
   contextMethod: RetrievalMethod;
   finalContext: string;
   contextTokens: number;
+  contextChunkCount: number;
   sourceDiversity: number;
 }
 

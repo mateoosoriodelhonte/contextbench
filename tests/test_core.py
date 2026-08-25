@@ -15,10 +15,19 @@ from contextbench.embedding import (
     SentenceTransformersEmbeddingProvider,
 )
 from contextbench.evaluation import hit_rate, mrr, ndcg_at_k, precision_at_k, recall_at_k
+from contextbench.experiments import (
+    evaluate_rankings,
+    map_ranked_chunks_to_relevance_anchors,
+)
 from contextbench.ingestion import IngestionError, ingest_bytes
 from contextbench.models import ChunkRecord, Document
 from contextbench.ollama import OllamaClient
-from contextbench.retrieval import RetrievalEngine, RetrievedChunk, build_context
+from contextbench.retrieval import (
+    RetrievalEngine,
+    RetrievedChunk,
+    assemble_context,
+    build_context,
+)
 from contextbench.schemas import ChunkingConfig, CreateProjectRequest, RetrievalMethod
 from contextbench.vector_store import LocalVectorStore
 
@@ -203,6 +212,49 @@ def test_context_builder_trims_at_a_deterministic_token_boundary() -> None:
     assert build_context(chunks, 17) == (
         "[1] source.md · chunk 4\n> one two three\n\n[2] source.md · chunk 5\n> four five"
     )
+    assembly = assemble_context(chunks, 9)
+    assert [chunk.chunk_id for chunk in assembly.chunks] == ["1"]
+
+
+def test_span_anchor_matching_preserves_units_and_later_evidence() -> None:
+    anchor = types.SimpleNamespace(id="anchor", document_id="document", start_char=0, end_char=60)
+    ranked = [
+        types.SimpleNamespace(
+            id="later-evidence", document_id="document", start_char=24, end_char=34
+        ),
+        types.SimpleNamespace(
+            id="earlier-noise", document_id="document", start_char=0, end_char=12
+        ),
+    ]
+    metric_ranking, matched, candidates = map_ranked_chunks_to_relevance_anchors(ranked, [anchor])
+    metrics = evaluate_rankings(metric_ranking, {"anchor"}, [1, 2])
+
+    assert metric_ranking[0] == "anchor"
+    assert matched == {"later-evidence": "anchor"}
+    assert candidates == {"anchor": ["later-evidence", "earlier-noise"]}
+    assert metrics["recall@1"] == 1.0
+    assert metrics["precision@1"] == 1.0
+    assert metrics["ndcg@1"] == 1.0
+    assert metrics["hitRate@1"] == 1.0
+    assert metrics["mrr"] == 1.0
+
+
+def test_span_anchor_matching_reassigns_coarse_hits_for_maximum_coverage() -> None:
+    anchors = [
+        types.SimpleNamespace(id="a", document_id="document", start_char=0, end_char=10),
+        types.SimpleNamespace(id="b", document_id="document", start_char=10, end_char=20),
+    ]
+    ranked = [
+        types.SimpleNamespace(id="coarse", document_id="document", start_char=0, end_char=20),
+        types.SimpleNamespace(id="first", document_id="document", start_char=0, end_char=10),
+    ]
+    metric_ranking, matched, _ = map_ranked_chunks_to_relevance_anchors(ranked, anchors)
+    metrics = evaluate_rankings(metric_ranking, {"a", "b"}, [2])
+
+    assert matched == {"coarse": "b", "first": "a"}
+    assert metrics["recall@2"] == 1.0
+    assert metrics["precision@2"] == 1.0
+    assert metrics["ndcg@2"] == 1.0
 
 
 class _FixedVectorStore:

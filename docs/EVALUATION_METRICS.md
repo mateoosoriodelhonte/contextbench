@@ -46,12 +46,15 @@ nDCG@K = DCG@K / IDCG@K
 `IDCG@K` is the DCG of an ideal ranking with `min(|R|, k)` relevant chunks first. nDCG is 0 when
 the returned ranking has no gain. An unjudged query is excluded from the aggregate.
 
-The saved chunk IDs anchor judgments to normalized document spans. The same index uses the exact
-judged ID. Another index maps each anchor to one representative chunk in the same document. It
-chooses the chunk with the greatest covered fraction, then the earliest span and ID for stable
-ties. One judgment therefore stays one relevance unit when smaller chunks create more overlaps.
-The experiment stores the mapping and its `single-best-overlap-v1` policy. This is a deterministic
-chunk-level approximation; V1 does not support labels that target text below the chunk level.
+The saved chunk IDs anchor judgments to normalized document spans. A returned chunk is eligible for
+an anchor when its span overlaps that anchor in the same document. ContextBench uses deterministic
+maximum matching in rank order. One result can satisfy one anchor, and one anchor can receive credit
+once. Smaller chunks therefore do not add relevance units, and the answer can occur in any
+overlapping fragment. The experiment stores all ranked overlap candidates, the matched
+result-to-anchor map, the metric input ranking, and its `span-anchor-matching-v1` policy.
+
+This is a deterministic span-level approximation. V1 does not support labels that target text below
+the judged chunk. Avoid overlapping judgments when each one is meant to describe a distinct fact.
 
 Metrics are macro means across judged queries. Per-query values, resolved relevance IDs, frozen
 dataset digest, index digest, mapping policy, and latency stay in the experiment export so one

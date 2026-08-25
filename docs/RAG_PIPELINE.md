@@ -15,12 +15,14 @@ ContextBench measures retrieval before optional generation.
 8. The context builder selects the highest requested stage in the order reranked, hybrid, vector,
    then BM25. It applies a token limit, adds numbered source headers, and quotes untrusted evidence
    lines so document text cannot create a source label.
-9. Evaluation maps saved source-span judgments to the selected index and compares returned chunk
-   IDs with the resolved relevant IDs.
+9. Evaluation treats saved source spans as stable relevance anchors. Rank-ordered maximum matching
+   gives each returned chunk credit for at most one overlapping anchor and gives each anchor credit
+   once. This keeps relevance units stable across chunk sizes.
 10. Ollama can receive the question and selected evidence after retrieval is complete.
 
 The context token count is a whitespace-based estimate. It supports deterministic trimming and
-does not claim to match a model-specific tokenizer.
+does not claim to match a model-specific tokenizer. Chunk count and source diversity describe only
+the chunks that fit in the final context, not the full retrieval ranking.
 
 Each retrieval response reports stage latency. These values describe that local run. They are not
 quality scores and are not portable benchmark claims.

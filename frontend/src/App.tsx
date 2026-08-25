@@ -1226,7 +1226,7 @@ function QueryDebugger(props: { workspace: Workspace }) {
                 />
                 <Metric
                   label="Final context"
-                  value={`${data().contextTokens} estimated tokens`}
+                  value={`${data().contextChunkCount} chunks · ${data().contextTokens} tokens`}
                   note="Whitespace estimate; deterministic trim"
                 />
                 <Metric
@@ -1269,6 +1269,7 @@ function QueryDebugger(props: { workspace: Workspace }) {
                   <span class="mono">
                     {data().contextTokens} / {contextLimit()} estimated tokens
                   </span>
+                  <span>{data().contextChunkCount} chunks</span>
                   <span>{data().sourceDiversity} unique sources</span>
                   <span>{data().contextMethod} ranking</span>
                   <span>

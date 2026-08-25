@@ -38,11 +38,19 @@ class RetrievalResult:
     latencies_ms: dict[str, float]
     context: str
     context_method: RetrievalMethod
+    context_chunks: tuple[RetrievedChunk, ...]
 
 
-def build_context(chunks: list[RetrievedChunk], max_tokens: int) -> str:
+@dataclass(frozen=True, slots=True)
+class ContextAssembly:
+    text: str
+    chunks: tuple[RetrievedChunk, ...]
+
+
+def assemble_context(chunks: list[RetrievedChunk], max_tokens: int) -> ContextAssembly:
     """Keep ranking order and quote untrusted text under generated citation headers."""
     selected: list[str] = []
+    selected_chunks: list[RetrievedChunk] = []
     used = 0
     for citation, chunk in enumerate(chunks, 1):
         safe_document_name = " ".join(chunk.document_name.split()) or "unknown"
@@ -57,10 +65,16 @@ def build_context(chunks: list[RetrievedChunk], max_tokens: int) -> str:
         if header_tokens + quote_tokens + len(text_words) > remaining:
             keep = remaining - header_tokens - quote_tokens
             selected.append(f"{header}\n> {' '.join(text_words[:keep])}")
+            selected_chunks.append(chunk)
             break
         selected.append(f"{header}\n> {' '.join(text_words)}")
+        selected_chunks.append(chunk)
         used += header_tokens + quote_tokens + len(text_words)
-    return "\n\n".join(selected)
+    return ContextAssembly("\n\n".join(selected), tuple(selected_chunks))
+
+
+def build_context(chunks: list[RetrievedChunk], max_tokens: int) -> str:
+    return assemble_context(chunks, max_tokens).text
 
 
 class RetrievalEngine:
@@ -249,10 +263,10 @@ class RetrievalEngine:
             if method.value in rankings
         )
         context_started = time.perf_counter()
-        context = build_context(rankings.get(context_method.value, []), max_context_tokens)
+        context = assemble_context(rankings.get(context_method.value, []), max_context_tokens)
         latencies["context"] = (time.perf_counter() - context_started) * 1000
         latencies["total"] = (time.perf_counter() - total_started) * 1000
-        return RetrievalResult(rankings, latencies, context, context_method)
+        return RetrievalResult(rankings, latencies, context.text, context_method, context.chunks)
 
     @staticmethod
     def _item(

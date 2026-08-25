@@ -3,7 +3,7 @@ from sqlalchemy import func, select
 
 from contextbench.api import MAX_REQUEST_BYTES, create_app
 from contextbench.db import create_session_factory
-from contextbench.models import RetrievalRun
+from contextbench.models import ChunkRecord, RetrievalRun
 
 
 def test_project_ingest_index_and_retrieve(tmp_path) -> None:
@@ -43,6 +43,7 @@ def test_project_ingest_index_and_retrieve(tmp_path) -> None:
     payload = retrieved.json()
     assert payload["finalContext"]
     assert payload["contextMethod"] == "HYBRID"
+    assert payload["contextChunkCount"] >= 1
     assert [lane["method"] for lane in payload["lanes"]] == ["VECTOR", "BM25", "HYBRID"]
     assert payload["stageLatency"]["totalMs"] >= 0
     assert set(payload["stageLatency"]) == {
@@ -237,7 +238,7 @@ def test_relevance_anchor_does_not_expand_with_smaller_chunks(tmp_path) -> None:
         files={
             "file": (
                 "facts.txt",
-                b"alpha beta unrelated one two three four five six seven",
+                b"unrelated one unrelated two alpha beta unrelated three unrelated four",
             )
         },
     )
@@ -294,12 +295,14 @@ def test_relevance_anchor_does_not_expand_with_smaller_chunks(tmp_path) -> None:
         experiment_ids.append(response.json()["id"])
         detail = client.get(f"/api/v1/experiments/{response.json()['id']}").json()
         assert detail["metrics"]["recall@1"] == 1.0
-        assert detail["configuration"]["relevanceMappingPolicy"] == "single-best-overlap-v1"
+        assert detail["configuration"]["relevanceMappingPolicy"] == "span-anchor-matching-v1"
         resolved = detail["results"][0]["rankings"]["resolvedRelevantChunkIds"]
         assert len(resolved) == 1
-        relevance_ids.append(resolved[0])
+        ranking = detail["results"][0]["rankings"]
+        assert ranking["metricRankingIds"][0] in ranking["relevantAnchorIds"]
+        relevance_ids.append(ranking["relevantAnchorIds"][0])
 
-    assert relevance_ids[0] != relevance_ids[1]
+    assert relevance_ids[0] == relevance_ids[1]
     comparison = client.post("/api/v1/experiments/compare", json={"experimentIds": experiment_ids})
     assert comparison.status_code == 200, comparison.text
 
@@ -399,3 +402,89 @@ def test_api_can_serve_a_built_single_page_frontend(tmp_path) -> None:
     missing_api = client.get("/api/v1/missing")
     assert missing_api.status_code == 404
     assert missing_api.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_context_metadata_counts_only_chunks_that_fit(tmp_path) -> None:
+    client = TestClient(
+        create_app(tmp_path / "db.sqlite", tmp_path / "vectors"),
+        base_url="http://localhost",
+    )
+    project_id = client.post("/api/v1/projects", json={"name": "Context trim"}).json()["id"]
+    for filename, text in (
+        ("first.txt", b"alpha first evidence words"),
+        ("second.txt", b"alpha second evidence words"),
+    ):
+        response = client.post(
+            f"/api/v1/projects/{project_id}/documents",
+            files={"file": (filename, text)},
+        )
+        assert response.status_code == 201, response.text
+    index = client.post(
+        f"/api/v1/projects/{project_id}/indexes",
+        json={
+            "name": "paragraphs",
+            "chunking": {"strategy": "PARAGRAPH"},
+            "embedding": {"provider": "hash"},
+        },
+    ).json()
+    response = client.post(
+        f"/api/v1/projects/{project_id}/retrieve",
+        json={
+            "query": "alpha evidence",
+            "indexConfigurationId": index["id"],
+            "methods": ["BM25"],
+            "topK": 2,
+            "candidateK": 2,
+            "maxContextTokens": 8,
+        },
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert len(payload["lanes"][0]["hits"]) == 2
+    assert payload["contextChunkCount"] == 1
+    assert payload["sourceDiversity"] == 1
+
+
+def test_retrieval_hit_keeps_page_provenance(tmp_path) -> None:
+    db_path = tmp_path / "db.sqlite"
+    client = TestClient(create_app(db_path, tmp_path / "vectors"), base_url="http://localhost")
+    project_id = client.post("/api/v1/projects", json={"name": "Page provenance"}).json()["id"]
+    client.post(
+        f"/api/v1/projects/{project_id}/documents",
+        files={"file": ("page.txt", b"alpha evidence on a stored page")},
+    )
+    index = client.post(
+        f"/api/v1/projects/{project_id}/indexes",
+        json={
+            "name": "pages",
+            "chunking": {"strategy": "PARAGRAPH"},
+            "embedding": {"provider": "hash"},
+        },
+    ).json()
+    with create_session_factory(db_path).begin() as session:
+        chunk = session.scalar(select(ChunkRecord))
+        assert chunk is not None
+        chunk.metadata_json = {"page": 3}
+    response = client.post(
+        f"/api/v1/projects/{project_id}/retrieve",
+        json={
+            "query": "alpha evidence",
+            "indexConfigurationId": index["id"],
+            "methods": ["BM25"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["lanes"][0]["hits"][0]["chunk"]["page"] == 3
+    assert "page 3" in response.json()["finalContext"]
+
+
+def test_production_docs_do_not_load_third_party_scripts(tmp_path) -> None:
+    client = TestClient(
+        create_app(tmp_path / "db.sqlite", tmp_path / "vectors"),
+        base_url="http://localhost",
+    )
+    for path in ("/docs", "/redoc"):
+        response = client.get(path)
+        assert response.status_code == 404
+        assert "cdn.jsdelivr.net" not in response.text
+        assert "fonts.googleapis.com" not in response.text

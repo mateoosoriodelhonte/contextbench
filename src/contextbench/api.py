@@ -30,7 +30,12 @@ from .embedding import (
     ModelRuntimeUnavailable,
     SentenceTransformersEmbeddingProvider,
 )
-from .experiments import compare_experiments, evaluate_rankings, export_experiment
+from .experiments import (
+    compare_experiments,
+    evaluate_rankings,
+    export_experiment,
+    map_ranked_chunks_to_relevance_anchors,
+)
 from .ingestion import MAX_DOCUMENT_BYTES, IngestionError, ingest_bytes
 from .models import (
     ChunkRecord,
@@ -65,7 +70,7 @@ from .schemas import (
 from .vector_store import LocalVectorStore
 
 MAX_REQUEST_BYTES = MAX_DOCUMENT_BYTES + 1024 * 1024
-RELEVANCE_MAPPING_POLICY = "single-best-overlap-v1"
+RELEVANCE_MAPPING_POLICY = "span-anchor-matching-v1"
 
 
 class APIError(Exception):
@@ -221,41 +226,6 @@ def _dataset_snapshot(
     return {"digest": _sha256_json(frozen), "queryCount": len(items), **frozen}
 
 
-def _mapped_relevance(
-    session: Any,
-    query: EvaluationQuery,
-    target_chunks: list[tuple[Document, ChunkRecord]],
-) -> dict[str, str]:
-    sources = _judged_chunks(session, query)
-    targets_by_id = {target.id: target for _, target in target_chunks}
-    resolved: dict[str, str] = {}
-    for source in sources:
-        if source.id in targets_by_id:
-            resolved[source.id] = source.id
-            continue
-        candidates = [
-            target
-            for _, target in target_chunks
-            if target.document_id == source.document_id
-            and target.start_char < source.end_char
-            and target.end_char > source.start_char
-        ]
-        if not candidates:
-            continue
-
-        def mapping_order(
-            target: ChunkRecord, source_chunk: ChunkRecord = source
-        ) -> tuple[float, int, str]:
-            overlap = min(target.end_char, source_chunk.end_char) - max(
-                target.start_char, source_chunk.start_char
-            )
-            target_coverage = overlap / max(target.end_char - target.start_char, 1)
-            return (-target_coverage, target.start_char, target.id)
-
-        resolved[source.id] = min(candidates, key=mapping_order).id
-    return resolved
-
-
 def _aggregate_experiment_metrics(experiment: Experiment) -> dict[str, float]:
     aggregate: dict[str, list[float]] = {}
     for result in experiment.results:
@@ -301,11 +271,11 @@ def create_app(
     frontend_dir: str | Path | None = None,
 ) -> FastAPI:
     state = AppState(db_path, vector_path)
-    app = FastAPI(title="ContextBench", version="1.0.0")
+    app = FastAPI(title="ContextBench", version="1.0.0", docs_url=None, redoc_url=None)
     app.add_middleware(RequestSizeLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["127.0.0.1", "localhost", "[::1]"],
+        allowed_hosts=["127.0.0.1", "localhost"],
     )
     app.state.contextbench = state
 
@@ -726,6 +696,7 @@ def create_app(
                                 "startChar": by_chunk[item.chunk_id].start_char,
                                 "endChar": by_chunk[item.chunk_id].end_char,
                                 "heading": by_chunk[item.chunk_id].heading,
+                                "page": item.page,
                             },
                             "nativeScore": item.native_score,
                             "rank": item.rank,
@@ -741,7 +712,7 @@ def create_app(
                 }
                 for method, items in result.rankings.items()
             ]
-            context_items = result.rankings.get(result.context_method.value, [])
+            context_items = result.context_chunks
             response_payload = {
                 "query": request.query,
                 "lanes": lanes,
@@ -756,6 +727,7 @@ def create_app(
                 "contextMethod": result.context_method.value,
                 "finalContext": result.context,
                 "contextTokens": len(result.context.split()),
+                "contextChunkCount": len(context_items),
                 "sourceDiversity": len({item.document_id for item in context_items}),
                 "reranker": (
                     {
@@ -948,11 +920,11 @@ def create_app(
                 reranker=reranker,
             )
             evaluated_query_ids: list[str] = []
+            chunks_by_id = {chunk.id: chunk for _, chunk in chunks}
             for query_row in queries:
-                judged_ids = {item.chunk_id for item in query_row.relevant_chunks}
-                relevance_mapping = _mapped_relevance(session, query_row, chunks)
-                relevant_ids = set(relevance_mapping.values())
-                if not relevant_ids:
+                anchors = _judged_chunks(session, query_row)
+                relevant_anchor_ids = {anchor.id for anchor in anchors}
+                if not relevant_anchor_ids:
                     continue
                 try:
                     result = engine.retrieve(
@@ -975,9 +947,13 @@ def create_app(
                 ranked_ids = [
                     item.chunk_id for item in result.rankings.get(request.method.value, [])
                 ]
+                ranked_chunks = [chunks_by_id[identifier] for identifier in ranked_ids]
+                metric_ranking, matched_chunks, relevance_candidates = (
+                    map_ranked_chunks_to_relevance_anchors(ranked_chunks, anchors)
+                )
                 metrics = evaluate_rankings(
-                    ranked_ids,
-                    relevant_ids,
+                    metric_ranking,
+                    relevant_anchor_ids,
                     request.k_values,
                 )
                 experiment.results.append(
@@ -987,11 +963,14 @@ def create_app(
                         rankings_json={
                             "query": query_row.query,
                             "method": request.method.value,
-                            "judgedChunkIds": sorted(judged_ids),
-                            "resolvedRelevantChunkIds": sorted(relevant_ids),
-                            "relevanceMapping": relevance_mapping,
+                            "judgedChunkIds": sorted(relevant_anchor_ids),
+                            "relevantAnchorIds": sorted(relevant_anchor_ids),
+                            "resolvedRelevantChunkIds": sorted(matched_chunks),
+                            "relevanceMapping": relevance_candidates,
+                            "rankedChunkAnchorMapping": matched_chunks,
                             "relevanceMappingPolicy": RELEVANCE_MAPPING_POLICY,
                             "chunkIds": ranked_ids,
+                            "metricRankingIds": metric_ranking,
                             "latenciesMs": result.latencies_ms,
                             "contextMethod": result.context_method.value,
                         },
@@ -1164,7 +1143,7 @@ def create_app(
 
         @app.get("/{path:path}", include_in_schema=False)
         def frontend(path: str) -> FileResponse:
-            if path.startswith("api/"):
+            if path.startswith("api/") or path in {"docs", "redoc"}:
                 raise APIError("NOT_FOUND", "API endpoint not found.", 404)
             candidate = (built_frontend / path).resolve()
             root = built_frontend.resolve()

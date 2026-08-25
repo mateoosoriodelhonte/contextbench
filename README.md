@@ -100,7 +100,8 @@ The app has no analytics or telemetry. Total request bodies and document uploads
 Uploads are extension-checked. Filenames cannot contain paths or control characters. Source files
 are data, not executable code. The UI renders
 document text as text nodes. Optional Ollama prompts label retrieved text as untrusted evidence
-and reject uncited or spoofed citations. The API rejects non-loopback Host headers.
+and reject uncited or spoofed citations. The API rejects non-loopback Host headers. Production
+startup disables API documentation pages that would load third-party scripts.
 
 See [Privacy](docs/PRIVACY.md) and [Security policy](SECURITY.md).
 

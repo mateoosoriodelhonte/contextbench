@@ -123,3 +123,7 @@ dataset snapshot, mapped relevance IDs, rankings, metric inputs, resolved rerank
 measured latency. Comparison requires one project, one frozen dataset digest, and the same set of
 evaluated queries. It also requires the same relevance mapping policy. Its export schema is
 `contextbench.experiment.v1`.
+
+Retrieval responses include the exact final-context chunk count, token estimate, source diversity,
+and page provenance when a source provides it. Production startup disables the CDN-backed FastAPI
+documentation pages. The versioned OpenAPI JSON remains available at `/openapi.json`.
