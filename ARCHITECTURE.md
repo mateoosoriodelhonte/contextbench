@@ -30,6 +30,8 @@ vectors while a normal index uses `BAAI/bge-small-en-v1.5`. Sentence Transformer
 separate query and document encoders for asymmetric search when a model supports them. See the
 [Sentence Transformers semantic search guide](https://www.sbert.net/examples/sentence_transformer/applications/semantic-search/README.html).
 
+The locked package and model review is in [dependency selection](docs/DEPENDENCY_SELECTION.md).
+
 ## Why vector and BM25
 
 Dense vectors can match related meaning when the query and evidence use different words. BM25
@@ -68,4 +70,3 @@ Document bytes, filenames, PDF structures, query text, tags, imported JSON, and 
 responses are untrusted. Extraction never executes source files. The API validates sizes and
 schemas at its boundary. The UI inserts document text as text nodes. The generation prompt labels
 retrieved text as evidence and states that instructions inside evidence have no authority.
-
