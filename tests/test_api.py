@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from contextbench.api import create_app
+from contextbench.api import MAX_REQUEST_BYTES, create_app
 from contextbench.db import create_session_factory
 from contextbench.models import RetrievalRun
 
@@ -226,6 +226,84 @@ def test_multiple_index_configurations_keep_their_own_chunks(tmp_path) -> None:
     assert incompatible.json()["error"]["code"] == "INCOMPATIBLE_EXPERIMENTS"
 
 
+def test_relevance_anchor_does_not_expand_with_smaller_chunks(tmp_path) -> None:
+    client = TestClient(
+        create_app(tmp_path / "db.sqlite", tmp_path / "vectors"),
+        base_url="http://localhost",
+    )
+    project_id = client.post("/api/v1/projects", json={"name": "Stable relevance"}).json()["id"]
+    uploaded = client.post(
+        f"/api/v1/projects/{project_id}/documents",
+        files={
+            "file": (
+                "facts.txt",
+                b"alpha beta unrelated one two three four five six seven",
+            )
+        },
+    )
+    assert uploaded.status_code == 201, uploaded.text
+
+    indexes = []
+    for name, chunking in (
+        ("paragraph", {"strategy": "PARAGRAPH"}),
+        ("fixed", {"strategy": "FIXED_TOKEN", "chunkSize": 2, "overlap": 0}),
+    ):
+        response = client.post(
+            f"/api/v1/projects/{project_id}/indexes",
+            json={
+                "name": name,
+                "chunking": chunking,
+                "embedding": {"provider": "hash"},
+            },
+        )
+        assert response.status_code == 201, response.text
+        indexes.append(response.json())
+
+    paragraph_hit = client.post(
+        f"/api/v1/projects/{project_id}/retrieve",
+        json={
+            "query": "alpha beta",
+            "indexConfigurationId": indexes[0]["id"],
+            "methods": ["BM25"],
+        },
+    ).json()["lanes"][0]["hits"][0]["chunk"]["id"]
+    judged = client.post(
+        f"/api/v1/projects/{project_id}/evaluation-queries",
+        json={
+            "query": "alpha beta",
+            "relevantChunkIds": [paragraph_hit],
+            "datasetVersion": 1,
+        },
+    )
+    assert judged.status_code == 201, judged.text
+
+    experiment_ids = []
+    relevance_ids = []
+    for index in indexes:
+        response = client.post(
+            f"/api/v1/projects/{project_id}/experiments",
+            json={
+                "name": f"bm25-{index['name']}",
+                "datasetVersion": 1,
+                "indexConfigurationId": index["id"],
+                "method": "BM25",
+                "kValues": [1],
+            },
+        )
+        assert response.status_code == 201, response.text
+        experiment_ids.append(response.json()["id"])
+        detail = client.get(f"/api/v1/experiments/{response.json()['id']}").json()
+        assert detail["metrics"]["recall@1"] == 1.0
+        assert detail["configuration"]["relevanceMappingPolicy"] == "single-best-overlap-v1"
+        resolved = detail["results"][0]["rankings"]["resolvedRelevantChunkIds"]
+        assert len(resolved) == 1
+        relevance_ids.append(resolved[0])
+
+    assert relevance_ids[0] != relevance_ids[1]
+    comparison = client.post("/api/v1/experiments/compare", json={"experimentIds": experiment_ids})
+    assert comparison.status_code == 200, comparison.text
+
+
 def test_consistent_validation_error_shape(tmp_path) -> None:
     client = TestClient(
         create_app(tmp_path / "db.sqlite", tmp_path / "vectors"),
@@ -242,6 +320,20 @@ def test_consistent_validation_error_shape(tmp_path) -> None:
         files={"file": ("safe.txt", b"safe text")},
     )
     assert tags.status_code == 422
+
+
+def test_request_body_limit_runs_before_request_parsing(tmp_path) -> None:
+    client = TestClient(
+        create_app(tmp_path / "db.sqlite", tmp_path / "vectors"),
+        base_url="http://localhost",
+    )
+    response = client.post(
+        "/api/v1/projects",
+        content=b"x" * (MAX_REQUEST_BYTES + 1),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "REQUEST_TOO_LARGE"
 
 
 def test_project_conflict_and_pagination_validation(tmp_path) -> None:
@@ -301,7 +393,9 @@ def test_api_can_serve_a_built_single_page_frontend(tmp_path) -> None:
         create_app(tmp_path / "db.sqlite", tmp_path / "vectors", frontend),
         base_url="http://localhost",
     )
-    assert client.get("/projects/demo/query").text == "<main>ContextBench</main>"
+    frontend_response = client.get("/projects/demo/query")
+    assert frontend_response.text == "<main>ContextBench</main>"
+    assert frontend_response.headers["x-frame-options"] == "DENY"
     missing_api = client.get("/api/v1/missing")
     assert missing_api.status_code == 404
     assert missing_api.json()["error"]["code"] == "NOT_FOUND"

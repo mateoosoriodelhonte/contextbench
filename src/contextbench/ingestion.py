@@ -56,7 +56,11 @@ def _decode_utf8(data: bytes) -> str:
 def ingest_bytes(
     filename: str, data: bytes, *, max_bytes: int = MAX_DOCUMENT_BYTES
 ) -> IngestedDocument:
-    if not filename or Path(filename).name != filename:
+    if (
+        not filename
+        or Path(filename).name != filename
+        or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+    ):
         raise IngestionError("filename must be a plain file name")
     if len(data) > max_bytes:
         raise IngestionError("document exceeds the maximum size")

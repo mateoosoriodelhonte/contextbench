@@ -45,8 +45,9 @@ def build_context(chunks: list[RetrievedChunk], max_tokens: int) -> str:
     selected: list[str] = []
     used = 0
     for citation, chunk in enumerate(chunks, 1):
+        safe_document_name = " ".join(chunk.document_name.split()) or "unknown"
         location = f" · page {chunk.page}" if chunk.page else ""
-        header = f"[{citation}] {chunk.document_name} · chunk {chunk.ordinal}{location}"
+        header = f"[{citation}] {safe_document_name} · chunk {chunk.ordinal}{location}"
         header_tokens = len(header.split())
         text_words = chunk.text.split()
         quote_tokens = 1

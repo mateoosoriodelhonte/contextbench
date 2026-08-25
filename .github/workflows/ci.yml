@@ -41,6 +41,19 @@ jobs:
         run: uv run pip-audit
       - name: Build package
         run: uv build
+      - name: Verify wheel contains browser app
+        run: |
+          uv run python - <<'PY'
+          import glob
+          import zipfile
+
+          wheel = glob.glob("dist/contextbench-*.whl")
+          assert len(wheel) == 1, wheel
+          with zipfile.ZipFile(wheel[0]) as archive:
+              names = archive.namelist()
+          assert "contextbench/frontend/index.html" in names
+          assert any(name.startswith("contextbench/frontend/assets/") for name in names)
+          PY
 
   frontend:
     name: SolidJS

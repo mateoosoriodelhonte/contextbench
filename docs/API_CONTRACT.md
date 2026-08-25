@@ -121,4 +121,5 @@ chunking, and vector distance. Changing one creates a new index.
 An experiment is immutable after execution. It stores dataset and index digests, the complete
 dataset snapshot, mapped relevance IDs, rankings, metric inputs, resolved reranker revision, and
 measured latency. Comparison requires one project, one frozen dataset digest, and the same set of
-evaluated queries. Its export schema is `contextbench.experiment.v1`.
+evaluated queries. It also requires the same relevance mapping policy. Its export schema is
+`contextbench.experiment.v1`.

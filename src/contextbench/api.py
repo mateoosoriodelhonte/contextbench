@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .bm25 import tokenize
 from .chunking import chunk_text
@@ -63,6 +64,9 @@ from .schemas import (
 )
 from .vector_store import LocalVectorStore
 
+MAX_REQUEST_BYTES = MAX_DOCUMENT_BYTES + 1024 * 1024
+RELEVANCE_MAPPING_POLICY = "single-best-overlap-v1"
+
 
 class APIError(Exception):
     def __init__(
@@ -78,6 +82,64 @@ def _error(exc: APIError) -> JSONResponse:
             error=ErrorBody(code=exc.code, message=exc.message, details=exc.details)
         ).model_dump(by_alias=True),
     )
+
+
+class RequestSizeLimitMiddleware:
+    """Reject oversized bodies before a framework parser sees them."""
+
+    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope.get("type") != "http" or scope.get("method") not in {
+            "POST",
+            "PUT",
+            "PATCH",
+        }:
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers", []))
+        content_length = headers.get(b"content-length", b"")
+        if content_length.isdigit() and int(content_length) > self.max_bytes:
+            await _error(
+                APIError("REQUEST_TOO_LARGE", "The request exceeds the maximum size.", 413)
+            )(scope, receive, send)
+            return
+
+        parts: list[bytes] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                return
+            part = bytes(message.get("body", b""))
+            total += len(part)
+            if total > self.max_bytes:
+                await _error(
+                    APIError("REQUEST_TOO_LARGE", "The request exceeds the maximum size.", 413)
+                )(scope, receive, send)
+                return
+            parts.append(part)
+            if not message.get("more_body", False):
+                break
+
+        body = b"".join(parts)
+        replayed = False
+
+        async def replay_receive() -> Message:
+            nonlocal replayed
+            if replayed:
+                return {"type": "http.disconnect"}
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        await self.app(scope, replay_receive, send)
 
 
 def _page(data: list[Any], page: int, page_size: int, total: int) -> dict[str, Any]:
@@ -159,25 +221,38 @@ def _dataset_snapshot(
     return {"digest": _sha256_json(frozen), "queryCount": len(items), **frozen}
 
 
-def _mapped_relevant_ids(
+def _mapped_relevance(
     session: Any,
     query: EvaluationQuery,
     target_chunks: list[tuple[Document, ChunkRecord]],
-) -> set[str]:
+) -> dict[str, str]:
     sources = _judged_chunks(session, query)
     targets_by_id = {target.id: target for _, target in target_chunks}
-    resolved: set[str] = set()
+    resolved: dict[str, str] = {}
     for source in sources:
         if source.id in targets_by_id:
-            resolved.add(source.id)
+            resolved[source.id] = source.id
             continue
-        resolved.update(
-            target.id
+        candidates = [
+            target
             for _, target in target_chunks
             if target.document_id == source.document_id
             and target.start_char < source.end_char
             and target.end_char > source.start_char
-        )
+        ]
+        if not candidates:
+            continue
+
+        def mapping_order(
+            target: ChunkRecord, source_chunk: ChunkRecord = source
+        ) -> tuple[float, int, str]:
+            overlap = min(target.end_char, source_chunk.end_char) - max(
+                target.start_char, source_chunk.start_char
+            )
+            target_coverage = overlap / max(target.end_char - target.start_char, 1)
+            return (-target_coverage, target.start_char, target.id)
+
+        resolved[source.id] = min(candidates, key=mapping_order).id
     return resolved
 
 
@@ -227,6 +302,7 @@ def create_app(
 ) -> FastAPI:
     state = AppState(db_path, vector_path)
     app = FastAPI(title="ContextBench", version="1.0.0")
+    app.add_middleware(RequestSizeLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
     app.add_middleware(
         TrustedHostMiddleware,
         allowed_hosts=["127.0.0.1", "localhost", "[::1]"],
@@ -859,6 +935,7 @@ def create_app(
                     "indexSnapshot": _index_response(config) | _chunk_snapshot(chunks),
                     "datasetSnapshot": snapshot,
                     "evaluatedQueryIds": [],
+                    "relevanceMappingPolicy": RELEVANCE_MAPPING_POLICY,
                 },
                 status="RUNNING",
             )
@@ -873,7 +950,8 @@ def create_app(
             evaluated_query_ids: list[str] = []
             for query_row in queries:
                 judged_ids = {item.chunk_id for item in query_row.relevant_chunks}
-                relevant_ids = _mapped_relevant_ids(session, query_row, chunks)
+                relevance_mapping = _mapped_relevance(session, query_row, chunks)
+                relevant_ids = set(relevance_mapping.values())
                 if not relevant_ids:
                     continue
                 try:
@@ -911,6 +989,8 @@ def create_app(
                             "method": request.method.value,
                             "judgedChunkIds": sorted(judged_ids),
                             "resolvedRelevantChunkIds": sorted(relevant_ids),
+                            "relevanceMapping": relevance_mapping,
+                            "relevanceMappingPolicy": RELEVANCE_MAPPING_POLICY,
                             "chunkIds": ranked_ids,
                             "latenciesMs": result.latencies_ms,
                             "contextMethod": result.context_method.value,
@@ -992,7 +1072,7 @@ def create_app(
     def compare(request: ExperimentComparisonRequest) -> dict[str, Any]:
         with state.factory() as session:
             experiments: list[dict[str, Any]] = []
-            compatibility: tuple[str, str, tuple[str, ...]] | None = None
+            compatibility: tuple[str, str, tuple[str, ...], str] | None = None
             for experiment_id in request.experiment_ids:
                 experiment = session.get(Experiment, str(experiment_id))
                 if experiment is None:
@@ -1001,11 +1081,17 @@ def create_app(
                     experiment.config_json.get("datasetSnapshot", {}).get("digest", "")
                 )
                 evaluated_ids = tuple(experiment.config_json.get("evaluatedQueryIds", []))
-                signature = (experiment.project_id, dataset_digest, evaluated_ids)
-                if not dataset_digest or (compatibility is not None and signature != compatibility):
+                mapping_policy = str(experiment.config_json.get("relevanceMappingPolicy", ""))
+                signature = (experiment.project_id, dataset_digest, evaluated_ids, mapping_policy)
+                if (
+                    not dataset_digest
+                    or not mapping_policy
+                    or (compatibility is not None and signature != compatibility)
+                ):
                     raise APIError(
                         "INCOMPATIBLE_EXPERIMENTS",
-                        "Experiments must share one project and frozen evaluation dataset.",
+                        "Experiments must share one project, frozen evaluation dataset, and "
+                        "relevance mapping policy.",
                         422,
                     )
                 compatibility = signature
@@ -1016,6 +1102,7 @@ def create_app(
                             "method": experiment.config_json.get("method"),
                             "indexSnapshot": experiment.config_json.get("indexSnapshot"),
                             "datasetDigest": dataset_digest,
+                            "relevanceMappingPolicy": mapping_policy,
                         },
                         "metrics": _aggregate_experiment_metrics(experiment),
                     }
@@ -1064,13 +1151,14 @@ def create_app(
             else "CITATIONS_MISSING",
         }
 
-    built_frontend = (
-        Path(frontend_dir)
-        if frontend_dir is not None
-        else Path(__file__).resolve().parents[2] / "frontend" / "dist"
-    )
+    packaged_frontend = Path(__file__).resolve().parent / "frontend"
+    source_frontend = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    built_frontend = Path(frontend_dir) if frontend_dir is not None else packaged_frontend
+    if frontend_dir is None and not (built_frontend / "index.html").is_file():
+        built_frontend = source_frontend
     if (built_frontend / "index.html").is_file():
         assets = built_frontend / "assets"
+        frontend_headers = {"X-Frame-Options": "DENY"}
         if assets.is_dir():
             app.mount("/assets", StaticFiles(directory=assets), name="frontend-assets")
 
@@ -1081,8 +1169,8 @@ def create_app(
             candidate = (built_frontend / path).resolve()
             root = built_frontend.resolve()
             if candidate.is_file() and (candidate == root or root in candidate.parents):
-                return FileResponse(candidate)
-            return FileResponse(root / "index.html")
+                return FileResponse(candidate, headers=frontend_headers)
+            return FileResponse(root / "index.html", headers=frontend_headers)
 
     return app
 

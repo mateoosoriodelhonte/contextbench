@@ -96,8 +96,9 @@ retrieval and does not invent a combined “RAG quality” score. See
 ## Privacy and security
 
 Documents, chunks, vectors, queries, and experiments stay in local SQLite and Qdrant files.
-The app has no analytics or telemetry. Uploads are size-limited and extension-checked.
-Filenames cannot contain paths. Source files are data, not executable code. The UI renders
+The app has no analytics or telemetry. Total request bodies and document uploads are size-limited.
+Uploads are extension-checked. Filenames cannot contain paths or control characters. Source files
+are data, not executable code. The UI renders
 document text as text nodes. Optional Ollama prompts label retrieved text as untrusted evidence
 and reject uncited or spoofed citations. The API rejects non-loopback Host headers.
 
@@ -113,6 +114,7 @@ The repository includes:
 - SolidJS component and API-client tests;
 - a Playwright Page Object Model test for the complete user flow;
 - Python format, lint, strict type, test, coverage, and package-build gates;
+- a wheel check that proves the browser app is present in the built package;
 - frontend format, lint, type, test, build, dependency-audit, and browser gates.
 
 The default benchmark runs the real hash embedding, Qdrant local, BM25, and hybrid paths on

@@ -15,6 +15,8 @@ dist/
 *.egg-info/
 node_modules/
 frontend/dist/
+!frontend/dist/
+!frontend/dist/**
 frontend/playwright-report/
 frontend/test-results/
 *.tsbuildinfo
