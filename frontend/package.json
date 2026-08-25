@@ -14,7 +14,6 @@
     "e2e": "playwright test"
   },
   "dependencies": {
-    "@phosphor-icons/react": "2.1.10",
     "@solidjs/router": "1.0.0",
     "solid-js": "1.9.15"
   },
