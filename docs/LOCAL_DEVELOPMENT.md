@@ -23,6 +23,17 @@ cd frontend
 npm run dev
 ```
 
+For a one-process production-style run, build the frontend and let FastAPI serve it:
+
+```bash
+cd frontend
+npm run build
+cd ..
+uv run contextbench serve
+```
+
+Open `http://127.0.0.1:8000/projects`.
+
 Both servers bind to `127.0.0.1`. The Vite server proxies `/api` to port 8000. ContextBench stores
 local state under `.contextbench/` unless `CONTEXTBENCH_DATA_DIR` names another directory.
 
@@ -36,6 +47,12 @@ To build a semantic index for the first time, choose Sentence Transformers in th
 shows the model, size, and cache location before it enables download consent. ContextBench never
 pulls an Ollama model.
 
+Install semantic embedding and reranking support only when needed:
+
+```bash
+uv sync --extra ml
+```
+
 Run all local gates:
 
 ```bash
@@ -43,6 +60,7 @@ uv run ruff format --check src tests
 uv run ruff check src tests
 uv run mypy src
 uv run pytest
+uv run pip-audit
 uv build
 cd frontend
 npm run format:check

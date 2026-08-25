@@ -52,7 +52,7 @@ def run_benchmark(corpus_size: int = 200, query_count: int = 20) -> dict[str, An
     pairs = [(document, chunk) for chunk in chunks]
     embedder = HashEmbeddingProvider()
     embed_started = time.perf_counter()
-    embedder.embed([chunk.text for chunk in chunks])
+    embedder.embed_documents([chunk.text for chunk in chunks])
     embedding_seconds = time.perf_counter() - embed_started
     with tempfile.TemporaryDirectory(prefix="contextbench-benchmark-") as directory:
         engine = RetrievalEngine(LocalVectorStore(Path(directory) / "qdrant"), embedder)

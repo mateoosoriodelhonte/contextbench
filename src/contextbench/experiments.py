@@ -29,7 +29,12 @@ def compare_experiments(experiments: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "schema": "contextbench.experiment.v1",
         "experiments": [
-            {"name": item.get("name"), "metrics": item.get("metrics", {})} for item in experiments
+            {
+                "name": item.get("name"),
+                "configuration": item.get("configuration", {}),
+                "metrics": item.get("metrics", {}),
+            }
+            for item in experiments
         ],
         "metricKeys": keys,
     }

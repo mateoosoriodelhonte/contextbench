@@ -11,7 +11,9 @@ from typing import Any, Protocol
 class EmbeddingProviderProtocol(Protocol):
     dimension: int
 
-    def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]: ...
+
+    def embed_query(self, text: str) -> list[float]: ...
 
 
 class HashEmbeddingProvider:
@@ -23,7 +25,7 @@ class HashEmbeddingProvider:
         self.dimension = dimension
         self.normalize = normalize
 
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    def _embed(self, texts: Sequence[str]) -> list[list[float]]:
         vectors: list[list[float]] = []
         for text in texts:
             vector = [0.0] * self.dimension
@@ -38,6 +40,12 @@ class HashEmbeddingProvider:
                     vector = [value / norm for value in vector]
             vectors.append(vector)
         return vectors
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        return self._embed(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed([text])[0]
 
 
 class ModelDownloadRequired(RuntimeError):
@@ -63,6 +71,22 @@ class SentenceTransformersEmbeddingProvider:
         self.allow_model_download = allow_model_download
         self._model: object | None = None
         self.dimension = 0
+        self.resolved_revision: str | None = None
+
+    @staticmethod
+    def _commit_hash(model: Any) -> str | None:
+        candidates = [model, getattr(model, "model", None)]
+        try:
+            first_module = model[0]
+        except (KeyError, TypeError, IndexError):
+            first_module = None
+        candidates.extend([first_module, getattr(first_module, "auto_model", None)])
+        for candidate in candidates:
+            config = getattr(candidate, "config", None)
+            commit = getattr(config, "_commit_hash", None)
+            if isinstance(commit, str) and commit:
+                return commit
+        return None
 
     def _load(self) -> object:
         if self._model is not None:
@@ -86,12 +110,23 @@ class SentenceTransformersEmbeddingProvider:
             raise
         model = self._model
         self.dimension = int(model.get_sentence_embedding_dimension())  # type: ignore[union-attr]
+        self.resolved_revision = self._commit_hash(model)
+        if self.resolved_revision is None:
+            self._model = None
+            raise ModelRuntimeUnavailable("the embedding model revision could not be resolved")
         return self._model
 
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         model: Any = self._load()
-        result = model.encode(list(texts), normalize_embeddings=self.normalize)
+        encoder = getattr(model, "encode_document", None) or model.encode
+        result = encoder(list(texts), normalize_embeddings=self.normalize)
         return [list(map(float, row)) for row in result]
+
+    def embed_query(self, text: str) -> list[float]:
+        model: Any = self._load()
+        encoder = getattr(model, "encode_query", None) or model.encode
+        result = encoder([text], normalize_embeddings=self.normalize)
+        return list(map(float, result[0]))
 
 
 class CrossEncoderReranker:
@@ -101,11 +136,14 @@ class CrossEncoderReranker:
         self,
         model: str = "cross-encoder/ms-marco-MiniLM-L6-v2",
         *,
+        revision: str | None = None,
         allow_model_download: bool = False,
     ) -> None:
         self.model_name = model
+        self.revision = revision
         self.allow_model_download = allow_model_download
         self._model: object | None = None
+        self.resolved_revision: str | None = None
 
     def _load(self) -> object:
         if self._model is not None:
@@ -119,13 +157,19 @@ class CrossEncoderReranker:
         try:
             self._model = CrossEncoder(
                 self.model_name,
+                revision=self.revision,
                 local_files_only=not self.allow_model_download,
             )
         except Exception as exc:
             if not self.allow_model_download:
                 raise ModelDownloadRequired(self.model_name) from exc
             raise
-        return self._model
+        model = self._model
+        self.resolved_revision = SentenceTransformersEmbeddingProvider._commit_hash(model)
+        if self.resolved_revision is None:
+            self._model = None
+            raise ModelRuntimeUnavailable("the reranker model revision could not be resolved")
+        return model
 
     def predict(self, pairs: Sequence[tuple[str, str]]) -> list[float]:
         model: Any = self._load()

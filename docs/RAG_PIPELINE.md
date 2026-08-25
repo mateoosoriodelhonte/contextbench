@@ -12,12 +12,15 @@ ContextBench measures retrieval before optional generation.
 5. BM25 builds a lexical corpus from the same frozen chunk set.
 6. A query can run vector search, BM25, or both. Reciprocal rank fusion combines ranks.
 7. An optional cross-encoder reranks a bounded candidate set.
-8. The context builder applies a token limit in rank order and adds numbered source headers to
-   the exact selected text.
-9. Evaluation compares returned chunk IDs with saved relevance judgments.
+8. The context builder selects the highest requested stage in the order reranked, hybrid, vector,
+   then BM25. It applies a token limit, adds numbered source headers, and quotes untrusted evidence
+   lines so document text cannot create a source label.
+9. Evaluation maps saved source-span judgments to the selected index and compares returned chunk
+   IDs with the resolved relevant IDs.
+10. Ollama can receive the question and selected evidence after retrieval is complete.
 
 The context token count is a whitespace-based estimate. It supports deterministic trimming and
-does not claim to match a model-specific tokenizer. 10. Ollama can receive the question and selected evidence after retrieval is complete.
+does not claim to match a model-specific tokenizer.
 
 Each retrieval response reports stage latency. These values describe that local run. They are not
 quality scores and are not portable benchmark claims.

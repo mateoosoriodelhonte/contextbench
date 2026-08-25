@@ -37,6 +37,8 @@ jobs:
         run: uv run mypy src
       - name: Test deterministic pipeline
         run: uv run pytest -m "not real_model" --cov=contextbench --cov-report=term-missing
+      - name: Audit Python dependencies
+        run: uv run pip-audit
       - name: Build package
         run: uv build
 

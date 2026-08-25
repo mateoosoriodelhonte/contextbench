@@ -32,10 +32,14 @@ export interface Project {
 }
 
 export interface ProjectOverview extends Project {
-  latestMetrics?: {
-    recallAt5: number;
-    mrrAt10: number;
-    queryCount: number;
+  totalIndexedTokens: number;
+  evaluationQueryCount: number;
+  latestExperiment?: {
+    id: string;
+    name: string;
+    method: RetrievalMethod;
+    executedAt?: string;
+    metrics: Record<string, number>;
   };
 }
 
@@ -102,6 +106,7 @@ export interface RetrievalRequest {
   maxContextTokens: number;
   reranker?: {
     model: string;
+    revision?: string;
     allowModelDownload: boolean;
   };
 }
@@ -111,6 +116,8 @@ export interface RetrievalHit {
   nativeScore: number;
   rank: number;
   candidateRank?: number;
+  vectorScore?: number;
+  bm25Score?: number;
   rrfScore?: number;
   crossEncoderScore?: number;
   rerankedRank?: number;
@@ -134,6 +141,7 @@ export interface RetrievalResponse {
     assembleMs: number;
     totalMs: number;
   };
+  contextMethod: RetrievalMethod;
   finalContext: string;
   contextTokens: number;
   sourceDiversity: number;
@@ -160,7 +168,14 @@ export interface Experiment {
 
 export interface ExperimentComparison {
   schema: "contextbench.experiment.v1";
-  experiments: Array<{ name: string; metrics: Record<string, number> }>;
+  experiments: Array<{
+    name: string;
+    configuration?: {
+      method?: RetrievalMethod;
+      datasetDigest?: string;
+    };
+    metrics: Record<string, number>;
+  }>;
   metricKeys: string[];
 }
 

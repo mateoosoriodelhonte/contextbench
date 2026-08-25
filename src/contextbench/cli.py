@@ -6,15 +6,17 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Annotated
 
 import typer
 from click import ClickException
 
-from .api import AppState, _chunk_metadata, create_app
+from .api import _chunk_metadata, create_app
 from .benchmarking import run_benchmark
 from .chunking import chunk_text
+from .config import DEFAULT_DATABASE_PATH, DEFAULT_VECTOR_PATH
 from .db import create_session_factory
 from .embedding import HashEmbeddingProvider
 from .ingestion import ingest_path
@@ -26,8 +28,8 @@ from .vector_store import LocalVectorStore
 app = typer.Typer(help="Local-first RAG retrieval evaluation workbench")
 project_app = typer.Typer(help="Manage projects")
 app.add_typer(project_app, name="project")
-DEFAULT_DB = Path(".contextbench/contextbench.sqlite3")
-DEFAULT_VECTORS = Path(".contextbench/qdrant")
+DEFAULT_DB = DEFAULT_DATABASE_PATH
+DEFAULT_VECTORS = DEFAULT_VECTOR_PATH
 
 
 @project_app.command("create")
@@ -36,8 +38,8 @@ def project_create(
     description: str | None = None,
     db: Path = typer.Option(DEFAULT_DB, "--db"),
 ) -> None:
-    project = AppState(db, DEFAULT_VECTORS).factory
-    with project.begin() as session:
+    factory = create_session_factory(db)
+    with factory.begin() as session:
         row = Project(name=name, description=description)
         session.add(row)
         session.flush()
@@ -111,7 +113,10 @@ def index(
                 chunks.append((doc, chunk))
         session.flush()
         engine = RetrievalEngine(LocalVectorStore(vectors), HashEmbeddingProvider())
+        indexing_started = time.perf_counter()
         count = engine.index(config.id, chunks)
+        config.vector_count = count
+        config.indexing_ms = (time.perf_counter() - indexing_started) * 1000
         config.status = "READY"
         typer.echo(json.dumps({"indexConfigurationId": config.id, "chunkCount": count}))
 
@@ -127,7 +132,7 @@ def query(
 ) -> None:
     from fastapi.testclient import TestClient
 
-    client = TestClient(create_app(db, vectors))
+    client = TestClient(create_app(db, vectors), base_url="http://localhost")
     response = client.post(
         f"/api/v1/projects/{project_id}/retrieve",
         json={
@@ -151,7 +156,7 @@ def eval_command(
 ) -> None:
     from fastapi.testclient import TestClient
 
-    client = TestClient(create_app(db, vectors))
+    client = TestClient(create_app(db, vectors), base_url="http://localhost")
     response = client.post(
         f"/api/v1/projects/{project_id}/experiments",
         json={
@@ -169,13 +174,10 @@ def eval_command(
     if detail.is_error:
         raise ClickException(detail.text)
     if json_output:
-        typer.echo(
-            json.dumps(
-                {"schema": "contextbench.experiment.v1", "experiment": detail.json()},
-                indent=2,
-                default=str,
-            )
-        )
+        exported = client.get(f"/api/v1/experiments/{experiment['id']}/export")
+        if exported.is_error:
+            raise ClickException(exported.text)
+        typer.echo(json.dumps(exported.json(), indent=2, default=str))
     else:
         typer.echo(f"{experiment['name']}: {experiment['resultCount']} evaluated queries")
         for name, value in sorted(detail.json()["metrics"].items()):
@@ -190,7 +192,7 @@ def compare(
 ) -> None:
     from fastapi.testclient import TestClient
 
-    response = TestClient(create_app(db, vectors)).post(
+    response = TestClient(create_app(db, vectors), base_url="http://localhost").post(
         "/api/v1/experiments/compare", json={"experimentIds": experiment_ids}
     )
     if response.is_error:
@@ -236,7 +238,8 @@ def serve(
     port: int = 8000,
     db: Path = typer.Option(DEFAULT_DB, "--db"),
     vectors: Path = typer.Option(DEFAULT_VECTORS, "--vectors"),
+    frontend: Path | None = typer.Option(None, "--frontend", exists=True, file_okay=False),
 ) -> None:
     import uvicorn
 
-    uvicorn.run(create_app(db, vectors), host=host, port=port)
+    uvicorn.run(create_app(db, vectors, frontend), host=host, port=port)

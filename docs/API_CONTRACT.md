@@ -68,15 +68,16 @@ Errors use one shape:
   "maxContextTokens": 1200,
   "reranker": {
     "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+    "revision": null,
     "allowModelDownload": false
   }
 }
 ```
 
-Each method returns its own ranking and native score. Hybrid results add an RRF score but
-do not pretend that cosine and BM25 scores share a scale. Reranked results retain the
-candidate retrieval rank and add a cross-encoder score and reranked rank. The response also
-contains measured stage latency and the exact deterministically trimmed final context.
+Each method returns its own native score. Hybrid and reranked hits also retain available vector,
+BM25, and RRF scores. Reranked results retain the candidate retrieval rank and add a cross-encoder
+score and reranked rank. The response names `contextMethod`, reports each latency stage, and
+returns the exact deterministically trimmed final context.
 
 ## Index request
 
@@ -101,7 +102,7 @@ contains measured stage latency and the exact deterministically trimmed final co
 
 The server returns `MODEL_DOWNLOAD_REQUIRED` before a model download unless the request explicitly
 allows it. The stored configuration clears that one-time consent after a successful build. An
-index freezes provider, model, requested revision, actual vector dimension, normalization,
+index freezes provider, model, resolved immutable revision, actual vector dimension, normalization,
 chunking, and vector distance. Changing one creates a new index.
 
 ## Experiment request
@@ -117,5 +118,7 @@ chunking, and vector distance. Changing one creates a new index.
 }
 ```
 
-An experiment is immutable after execution. Its export schema is
-`contextbench.experiment.v1`.
+An experiment is immutable after execution. It stores dataset and index digests, the complete
+dataset snapshot, mapped relevance IDs, rankings, metric inputs, resolved reranker revision, and
+measured latency. Comparison requires one project, one frozen dataset digest, and the same set of
+evaluated queries. Its export schema is `contextbench.experiment.v1`.

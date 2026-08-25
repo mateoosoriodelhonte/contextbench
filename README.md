@@ -37,20 +37,12 @@ cd contextbench
 uv sync --extra dev
 cd frontend
 npm ci --ignore-scripts
-```
-
-Start the API and web app in two terminals:
-
-```bash
+npm run build
+cd ..
 uv run contextbench serve
 ```
 
-```bash
-cd frontend
-npm run dev
-```
-
-Open `http://127.0.0.1:4173/projects`. Choose **Load real demo** for a deterministic local
+Open `http://127.0.0.1:8000/projects`. Choose **Load real demo** for a deterministic local
 corpus, hash vectors, and relevance judgments. This path downloads no ML model.
 
 ContextBench stores its state under `.contextbench/` by default. Both servers bind to
@@ -81,6 +73,9 @@ approximate download size, and normal Hugging Face cache location before it lets
 download either model. A cached model can run without download consent. ContextBench never
 pulls an Ollama model.
 
+Install the optional local ML runtime with `uv sync --extra ml`. Successful index builds record
+the resolved model revision so later query embeddings use the same weights.
+
 The built-in hash provider is deterministic and useful for the demo, tests, and pipeline
 checks. Semantic-quality evaluation requires a semantic embedding model.
 
@@ -104,7 +99,7 @@ Documents, chunks, vectors, queries, and experiments stay in local SQLite and Qd
 The app has no analytics or telemetry. Uploads are size-limited and extension-checked.
 Filenames cannot contain paths. Source files are data, not executable code. The UI renders
 document text as text nodes. Optional Ollama prompts label retrieved text as untrusted evidence
-and reject uncited output.
+and reject uncited or spoofed citations. The API rejects non-loopback Host headers.
 
 See [Privacy](docs/PRIVACY.md) and [Security policy](SECURITY.md).
 

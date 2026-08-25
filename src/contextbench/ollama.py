@@ -43,7 +43,9 @@ class OllamaClient:
         if not isinstance(data, dict) or not isinstance(data.get("response"), str):
             raise ValueError("invalid Ollama response")
         answer = cast(str, data["response"]).strip()
-        available_citations = set(re.findall(r"(?m)^\[(\d+)\]", context))
+        available_citations = set(
+            re.findall(r"(?m)^\[(\d+)\] [^\n]+ · chunk \d+(?: · page \d+)?$", context)
+        )
         answer_citations = set(re.findall(r"\[(\d+)\]", answer))
         if (
             not answer

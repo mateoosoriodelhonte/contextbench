@@ -517,11 +517,45 @@ function OverviewView(props: { workspace: Workspace }) {
             note="Across all index configurations"
           />
           <Metric
+            label="Indexed tokens"
+            value={String(project()?.totalIndexedTokens ?? 0)}
+            note="Whitespace token estimate"
+          />
+          <Metric
             label="Latest vector count"
             value={String(latest()?.vectorCount ?? 0)}
             note={latest()?.embedding.model ?? "Build an index"}
           />
+          <Metric
+            label="Evaluation queries"
+            value={String(project()?.evaluationQueryCount ?? 0)}
+            note={
+              project()?.latestExperiment
+                ? `Latest: ${project()?.latestExperiment?.name}`
+                : "Create relevance judgments"
+            }
+          />
         </section>
+        <Show when={project()?.latestExperiment}>
+          {(experiment) => (
+            <section class="panel">
+              <div class="section-heading">
+                <h2>{experiment().name}</h2>
+                <span>{experiment().method} · latest experiment</span>
+              </div>
+              <div class="metric-strip">
+                <For each={Object.entries(experiment().metrics)}>
+                  {([metric, value]) => (
+                    <span>
+                      <small>{metric}</small>
+                      <strong class="mono">{value.toFixed(4)}</strong>
+                    </span>
+                  )}
+                </For>
+              </div>
+            </section>
+          )}
+        </Show>
         <section class="panel panel--accent">
           <h2>Retrieval first</h2>
           <p class="panel-copy">
@@ -788,6 +822,9 @@ function IndexesView(props: { workspace: Workspace }) {
                   dimensions. It is stored in the Hugging Face cache, normally{" "}
                   <span class="mono">~/.cache/huggingface</span>.
                 </p>
+                <p class="helper-text">
+                  Install local ML support first with uv sync --extra ml.
+                </p>
                 <label class="checkbox-row">
                   <input
                     type="checkbox"
@@ -887,6 +924,7 @@ function QueryDebugger(props: { workspace: Workspace }) {
   const [topK, setTopK] = createSignal(5);
   const [candidateK, setCandidateK] = createSignal(20);
   const [contextLimit, setContextLimit] = createSignal(1200);
+  const [documentId, setDocumentId] = createSignal("");
   const [sourceType, setSourceType] = createSignal("");
   const [tag, setTag] = createSignal("");
   const [rerank, setRerank] = createSignal(false);
@@ -899,6 +937,10 @@ function QueryDebugger(props: { workspace: Workspace }) {
   const [indexes] = createResource(
     () => [props.workspace.projectId(), props.workspace.revision()] as const,
     ([id]) => (id ? api.listIndexes(id) : undefined),
+  );
+  const [documents] = createResource(
+    () => [props.workspace.projectId(), props.workspace.revision()] as const,
+    ([id]) => (id ? api.listDocuments(id) : undefined),
   );
   createEffect(() => {
     const items = indexes()?.data ?? [];
@@ -929,7 +971,7 @@ function QueryDebugger(props: { workspace: Workspace }) {
           candidateK: candidateK(),
           methods,
           filters: {
-            documentIds: [],
+            documentIds: documentId() ? [documentId()] : [],
             sourceTypes: sourceType() ? [sourceType()] : [],
             tags: tag() ? [tag()] : [],
           },
@@ -1078,6 +1120,21 @@ function QueryDebugger(props: { workspace: Workspace }) {
               </label>
             </div>
             <div class="config-grid">
+              <label for="document-filter">
+                Document filter
+                <select
+                  id="document-filter"
+                  value={documentId()}
+                  onChange={(event) => setDocumentId(event.currentTarget.value)}
+                >
+                  <option value="">All documents</option>
+                  <For each={documents()?.data ?? []}>
+                    {(document) => (
+                      <option value={document.id}>{document.filename}</option>
+                    )}
+                  </For>
+                </select>
+              </label>
               <label for="source-filter">
                 Source filter
                 <select
@@ -1119,6 +1176,9 @@ function QueryDebugger(props: { workspace: Workspace }) {
                 <p>
                   cross-encoder/ms-marco-MiniLM-L6-v2 is about 90 MB and is
                   stored in the Hugging Face cache.
+                </p>
+                <p class="helper-text">
+                  Install local ML support first with uv sync --extra ml.
                 </p>
                 <label class="checkbox-row">
                   <input
@@ -1210,6 +1270,7 @@ function QueryDebugger(props: { workspace: Workspace }) {
                     {data().contextTokens} / {contextLimit()} estimated tokens
                   </span>
                   <span>{data().sourceDiversity} unique sources</span>
+                  <span>{data().contextMethod} ranking</span>
                   <span>
                     Deterministic whole-chunk order with boundary trim
                   </span>
@@ -1353,7 +1414,14 @@ function HitRow(props: {
         <span class="rank-number">
           {String(props.hit.rank).padStart(2, "0")}
         </span>
-        <span class="rank-label">rank</span>
+        <span class="rank-label">
+          {props.method === "RERANKED" ? "rerank" : "rank"}
+        </span>
+        <Show when={props.hit.candidateRank != null}>
+          <span class="rank-label">
+            from {String(props.hit.candidateRank).padStart(2, "0")}
+          </span>
+        </Show>
       </div>
       <div class="hit-content">
         <div class="hit-meta">
@@ -1405,6 +1473,20 @@ function HitRow(props: {
                 <strong class="mono">{props.hit.rrfScore?.toFixed(6)}</strong>
               </span>
             </Show>
+            <Show when={props.hit.vectorScore != null}>
+              <span>
+                Vector{" "}
+                <strong class="mono">
+                  {props.hit.vectorScore?.toFixed(6)}
+                </strong>
+              </span>
+            </Show>
+            <Show when={props.hit.bm25Score != null}>
+              <span>
+                BM25{" "}
+                <strong class="mono">{props.hit.bm25Score?.toFixed(3)}</strong>
+              </span>
+            </Show>
             <Show when={props.hit.crossEncoderScore != null}>
               <span>
                 Cross-encoder{" "}
@@ -1421,7 +1503,14 @@ function HitRow(props: {
           {props.hit.nativeScore.toFixed(props.method === "BM25" ? 3 : 6)}
         </strong>
         <span>
-          {props.method === "RERANKED" ? "reranker score" : "native score"}
+          {
+            {
+              VECTOR: "cosine score",
+              BM25: "BM25 score",
+              HYBRID: "RRF score",
+              RERANKED: "cross-encoder score",
+            }[props.method]
+          }
         </span>
       </div>
     </div>

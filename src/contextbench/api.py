@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
@@ -11,10 +12,15 @@ from typing import Annotated, Any, cast
 import httpx
 from fastapi import FastAPI, File, Form, Query, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from fastapi.responses import FileResponse, JSONResponse
+from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.staticfiles import StaticFiles
 
+from .bm25 import tokenize
 from .chunking import chunk_text
+from .config import DEFAULT_DATABASE_PATH, DEFAULT_VECTOR_PATH
 from .db import create_session_factory
 from .embedding import (
     CrossEncoderReranker,
@@ -45,6 +51,7 @@ from .schemas import (
     ErrorResponse,
     EvaluationDatasetImport,
     EvaluationQueryRequest,
+    ExperimentComparisonRequest,
     ExperimentRequest,
     GenerateRequest,
     IndexConfigurationRequest,
@@ -96,6 +103,92 @@ def _chunk_metadata(
     return metadata
 
 
+def _sha256_json(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _chunk_snapshot(chunks: list[tuple[Document, ChunkRecord]]) -> dict[str, Any]:
+    items = [
+        {
+            "id": chunk.id,
+            "documentId": chunk.document_id,
+            "ordinal": chunk.ordinal,
+            "startChar": chunk.start_char,
+            "endChar": chunk.end_char,
+            "textSha256": hashlib.sha256(chunk.text.encode()).hexdigest(),
+        }
+        for _, chunk in chunks
+    ]
+    return {"digest": _sha256_json(items), "chunkCount": len(items)}
+
+
+def _judged_chunks(session: Any, query: EvaluationQuery) -> list[ChunkRecord]:
+    return sorted(
+        [
+            chunk
+            for item in query.relevant_chunks
+            if (chunk := session.get(ChunkRecord, item.chunk_id)) is not None
+        ],
+        key=lambda chunk: chunk.id,
+    )
+
+
+def _dataset_snapshot(
+    session: Any, queries: list[EvaluationQuery], dataset_version: int
+) -> dict[str, Any]:
+    items = [
+        {
+            "id": query.id,
+            "query": query.query,
+            "notes": query.notes,
+            "relevantSources": [
+                {
+                    "chunkId": chunk.id,
+                    "documentId": chunk.document_id,
+                    "startChar": chunk.start_char,
+                    "endChar": chunk.end_char,
+                    "textSha256": hashlib.sha256(chunk.text.encode()).hexdigest(),
+                }
+                for chunk in _judged_chunks(session, query)
+            ],
+        }
+        for query in queries
+    ]
+    frozen = {"datasetVersion": dataset_version, "queries": items}
+    return {"digest": _sha256_json(frozen), "queryCount": len(items), **frozen}
+
+
+def _mapped_relevant_ids(
+    session: Any,
+    query: EvaluationQuery,
+    target_chunks: list[tuple[Document, ChunkRecord]],
+) -> set[str]:
+    sources = _judged_chunks(session, query)
+    targets_by_id = {target.id: target for _, target in target_chunks}
+    resolved: set[str] = set()
+    for source in sources:
+        if source.id in targets_by_id:
+            resolved.add(source.id)
+            continue
+        resolved.update(
+            target.id
+            for _, target in target_chunks
+            if target.document_id == source.document_id
+            and target.start_char < source.end_char
+            and target.end_char > source.start_char
+        )
+    return resolved
+
+
+def _aggregate_experiment_metrics(experiment: Experiment) -> dict[str, float]:
+    aggregate: dict[str, list[float]] = {}
+    for result in experiment.results:
+        for key, value in result.metrics_json.items():
+            aggregate.setdefault(key, []).append(float(value))
+    return {key: sum(values) / len(values) for key, values in aggregate.items() if values}
+
+
 class AppState:
     def __init__(self, db_path: str | Path, vector_path: str | Path) -> None:
         self.factory = create_session_factory(db_path)
@@ -122,16 +215,22 @@ class AppState:
             return None
         return CrossEncoderReranker(
             config.model,
+            revision=config.revision,
             allow_model_download=config.allow_model_download,
         )
 
 
 def create_app(
-    db_path: str | Path = ".contextbench/contextbench.sqlite3",
-    vector_path: str | Path = ".contextbench/qdrant",
+    db_path: str | Path = DEFAULT_DATABASE_PATH,
+    vector_path: str | Path = DEFAULT_VECTOR_PATH,
+    frontend_dir: str | Path | None = None,
 ) -> FastAPI:
     state = AppState(db_path, vector_path)
     app = FastAPI(title="ContextBench", version="1.0.0")
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["127.0.0.1", "localhost", "[::1]"],
+    )
     app.state.contextbench = state
 
     @app.exception_handler(APIError)
@@ -154,7 +253,16 @@ def create_app(
         page_size: Annotated[int, Query(ge=1, le=200)] = 50,
     ) -> dict[str, Any]:
         with state.factory() as session:
-            rows = list(session.scalars(select(Project).order_by(Project.created_at.desc())))
+            total = int(session.scalar(select(func.count()).select_from(Project)) or 0)
+            rows = list(
+                session.scalars(
+                    select(Project)
+                    .options(selectinload(Project.documents), selectinload(Project.indexes))
+                    .order_by(Project.created_at.desc())
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
+            )
             data = [
                 {
                     "id": row.id,
@@ -168,7 +276,7 @@ def create_app(
                 }
                 for row in rows
             ]
-        return _page(data[(page - 1) * page_size : page * page_size], page, page_size, len(data))
+        return _page(data, page, page_size, total)
 
     @app.post("/api/v1/projects", status_code=201)
     def create_project(request: CreateProjectRequest) -> dict[str, Any]:
@@ -211,6 +319,28 @@ def create_app(
     def get_project(project_id: str) -> dict[str, Any]:
         with state.factory() as session:
             project = project_or_error(session, project_id)
+            total_tokens = int(
+                session.scalar(
+                    select(func.coalesce(func.sum(ChunkRecord.token_count), 0))
+                    .join(IndexConfiguration)
+                    .where(IndexConfiguration.project_id == project_id)
+                )
+                or 0
+            )
+            evaluation_count = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(EvaluationQuery)
+                    .where(EvaluationQuery.project_id == project_id)
+                )
+                or 0
+            )
+            latest_experiment = session.scalar(
+                select(Experiment)
+                .where(Experiment.project_id == project_id)
+                .order_by(Experiment.created_at.desc())
+                .limit(1)
+            )
             return {
                 "id": project.id,
                 "name": project.name,
@@ -218,6 +348,19 @@ def create_app(
                 "createdAt": project.created_at,
                 "documentCount": len(project.documents),
                 "indexCount": len(project.indexes),
+                "totalIndexedTokens": total_tokens,
+                "evaluationQueryCount": evaluation_count,
+                "latestExperiment": (
+                    {
+                        "id": latest_experiment.id,
+                        "name": latest_experiment.name,
+                        "method": latest_experiment.config_json.get("method"),
+                        "executedAt": latest_experiment.executed_at,
+                        "metrics": _aggregate_experiment_metrics(latest_experiment),
+                    }
+                    if latest_experiment is not None
+                    else None
+                ),
                 "status": "READY",
                 "updatedAt": project.created_at,
             }
@@ -230,12 +373,24 @@ def create_app(
     ) -> dict[str, Any]:
         with state.factory() as session:
             project_or_error(session, project_id)
-            rows = list(
-                session.scalars(
-                    select(Document)
+            total = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(Document)
                     .where(Document.project_id == project_id)
-                    .order_by(Document.created_at.desc())
                 )
+                or 0
+            )
+            rows = list(
+                session.execute(
+                    select(Document, func.count(ChunkRecord.id))
+                    .outerjoin(ChunkRecord)
+                    .where(Document.project_id == project_id)
+                    .group_by(Document.id)
+                    .order_by(Document.created_at.desc())
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                ).all()
             )
             data = [
                 {
@@ -243,15 +398,15 @@ def create_app(
                     "filename": row.filename,
                     "sourceType": row.source_type,
                     "tags": row.tags,
-                    "chunkCount": len(row.chunks),
+                    "chunkCount": chunk_count,
                     "status": "READY",
                     "updatedAt": row.created_at,
                     "sha256": row.sha256,
                     "createdAt": row.created_at,
                 }
-                for row in rows
+                for row, chunk_count in rows
             ]
-        return _page(data[(page - 1) * page_size : page * page_size], page, page_size, len(data))
+        return _page(data, page, page_size, total)
 
     @app.post("/api/v1/projects/{project_id}/documents", status_code=201)
     async def ingest_document(
@@ -259,6 +414,8 @@ def create_app(
         file: UploadFile = File(...),  # noqa: B008
         tags: str = Form(""),  # noqa: B008
     ) -> dict[str, Any]:
+        if len(tags) > 2000:
+            raise APIError("VALIDATION_ERROR", "Tags exceed the maximum size.", 422)
         data = await file.read(MAX_DOCUMENT_BYTES + 1)
         try:
             ingested = ingest_bytes(file.filename or "document.txt", data)
@@ -276,6 +433,10 @@ def create_app(
                     "id": existing.id,
                     "filename": existing.filename,
                     "sourceType": existing.source_type,
+                    "tags": existing.tags,
+                    "chunkCount": len(existing.chunks),
+                    "status": "READY",
+                    "updatedAt": existing.created_at,
                     "sha256": existing.sha256,
                     "createdAt": existing.created_at,
                     "reused": True,
@@ -286,7 +447,7 @@ def create_app(
                 source_type=ingested.source_type.value,
                 content=ingested.text,
                 sha256=ingested.sha256,
-                tags=[tag.strip() for tag in tags.split(",") if tag.strip()][:20],
+                tags=[tag.strip()[:100] for tag in tags.split(",") if tag.strip()][:20],
                 metadata_json=ingested.metadata,
             )
             session.add(document)
@@ -295,6 +456,10 @@ def create_app(
                 "id": document.id,
                 "filename": document.filename,
                 "sourceType": document.source_type,
+                "tags": document.tags,
+                "chunkCount": 0,
+                "status": "READY",
+                "updatedAt": document.created_at,
                 "sha256": document.sha256,
                 "createdAt": document.created_at,
                 "reused": False,
@@ -316,9 +481,12 @@ def create_app(
                 statement = statement.where(
                     ChunkRecord.index_configuration_id == index_configuration_id
                 )
+            total = int(session.scalar(select(func.count()).select_from(statement.subquery())) or 0)
             rows = list(
                 session.scalars(
                     statement.order_by(ChunkRecord.index_configuration_id, ChunkRecord.ordinal)
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
                 )
             )
         data = [
@@ -338,7 +506,7 @@ def create_app(
             }
             for row in rows
         ]
-        return _page(data[(page - 1) * page_size : page * page_size], page, page_size, len(data))
+        return _page(data, page, page_size, total)
 
     @app.get("/api/v1/projects/{project_id}/indexes")
     def list_indexes(project_id: str) -> dict[str, Any]:
@@ -346,7 +514,9 @@ def create_app(
             project_or_error(session, project_id)
             rows = list(
                 session.scalars(
-                    select(IndexConfiguration).where(IndexConfiguration.project_id == project_id)
+                    select(IndexConfiguration)
+                    .where(IndexConfiguration.project_id == project_id)
+                    .order_by(IndexConfiguration.created_at)
                 )
             )
         return {"data": [_index_response(row) for row in rows]}
@@ -391,15 +561,14 @@ def create_app(
             try:
                 indexing_started = time.perf_counter()
                 embedder = state.embedder(config)
-                if embedder.dimension == 0:
-                    embedder.embed([""])
-                    config.vector_dimension = embedder.dimension
                 engine = RetrievalEngine(state.store, embedder)
                 count = engine.index(config.id, chunks)
                 config.vector_count = count
                 config.indexing_ms = (time.perf_counter() - indexing_started) * 1000
                 config.embedding_json = config.embedding_json | {
                     "dimension": embedder.dimension,
+                    "revision": getattr(embedder, "resolved_revision", None)
+                    or config.embedding_json.get("revision"),
                     "allowModelDownload": False,
                 }
                 config.status = "READY"
@@ -430,11 +599,12 @@ def create_app(
             if config is None or config.project_id != project_id:
                 raise APIError("NOT_FOUND", "Index configuration not found.", 404)
             chunks = chunks_for_index(session, config.id)
+            reranker = state.reranker(request.reranker)
             try:
                 result = RetrievalEngine(
                     state.store,
                     state.embedder(config),
-                    reranker=state.reranker(request.reranker),
+                    reranker=reranker,
                 ).retrieve(
                     config.id,
                     request.query,
@@ -448,7 +618,7 @@ def create_app(
             except ModelDownloadRequired as exc:
                 raise APIError(
                     "MODEL_DOWNLOAD_REQUIRED",
-                    "The embedding model is not cached.",
+                    "The requested local model is not cached.",
                     409,
                     {"model": str(exc)},
                 ) from exc
@@ -483,7 +653,9 @@ def create_app(
                             },
                             "nativeScore": item.native_score,
                             "rank": item.rank,
-                            "candidateRank": item.rank,
+                            "candidateRank": item.candidate_rank,
+                            "vectorScore": item.vector_score,
+                            "bm25Score": item.bm25_score,
                             "rrfScore": item.rrf_score,
                             "crossEncoderScore": item.cross_encoder_score,
                             "rerankedRank": item.reranked_rank,
@@ -493,9 +665,7 @@ def create_app(
                 }
                 for method, items in result.rankings.items()
             ]
-            context_items = next(
-                (items for items in reversed(list(result.rankings.values())) if items), []
-            )
+            context_items = result.rankings.get(result.context_method.value, [])
             response_payload = {
                 "query": request.query,
                 "lanes": lanes,
@@ -507,9 +677,18 @@ def create_app(
                     "assembleMs": result.latencies_ms.get("context", 0.0),
                     "totalMs": result.latencies_ms.get("total", 0.0),
                 },
+                "contextMethod": result.context_method.value,
                 "finalContext": result.context,
                 "contextTokens": len(result.context.split()),
                 "sourceDiversity": len({item.document_id for item in context_items}),
+                "reranker": (
+                    {
+                        "model": request.reranker.model,
+                        "revision": reranker.resolved_revision,
+                    }
+                    if request.reranker is not None and reranker is not None
+                    else None
+                ),
             }
             session.add(
                 RetrievalRun(
@@ -545,46 +724,51 @@ def create_app(
             ]
         return {"data": data}
 
+    def add_eval_query(
+        session: Any, project_id: str, request: EvaluationQueryRequest
+    ) -> dict[str, Any]:
+        project_or_error(session, project_id)
+        chunk_ids = {str(chunk_id) for chunk_id in request.relevant_chunk_ids}
+        valid_chunk_ids = set(
+            session.scalars(
+                select(ChunkRecord.id)
+                .join(IndexConfiguration)
+                .where(
+                    IndexConfiguration.project_id == project_id,
+                    ChunkRecord.id.in_(chunk_ids),
+                )
+            )
+        )
+        if chunk_ids != valid_chunk_ids:
+            raise APIError(
+                "VALIDATION_ERROR",
+                "Every relevant chunk must belong to this project.",
+                422,
+                {"unknownChunkIds": sorted(chunk_ids - valid_chunk_ids)},
+            )
+        row = EvaluationQuery(
+            project_id=project_id,
+            query=request.query,
+            dataset_version=request.dataset_version,
+            notes=request.notes,
+        )
+        row.relevant_chunks = [
+            RelevantChunk(chunk_id=str(chunk_id)) for chunk_id in request.relevant_chunk_ids
+        ]
+        session.add(row)
+        session.flush()
+        return {
+            "id": row.id,
+            "query": row.query,
+            "datasetVersion": row.dataset_version,
+            "relevantChunkIds": [str(item) for item in request.relevant_chunk_ids],
+            "notes": row.notes,
+        }
+
     @app.post("/api/v1/projects/{project_id}/evaluation-queries", status_code=201)
     def create_eval_query(project_id: str, request: EvaluationQueryRequest) -> dict[str, Any]:
         with state.factory.begin() as session:
-            project_or_error(session, project_id)
-            chunk_ids = {str(chunk_id) for chunk_id in request.relevant_chunk_ids}
-            valid_chunk_ids = set(
-                session.scalars(
-                    select(ChunkRecord.id)
-                    .join(IndexConfiguration)
-                    .where(
-                        IndexConfiguration.project_id == project_id,
-                        ChunkRecord.id.in_(chunk_ids),
-                    )
-                )
-            )
-            if chunk_ids != valid_chunk_ids:
-                raise APIError(
-                    "VALIDATION_ERROR",
-                    "Every relevant chunk must belong to this project.",
-                    422,
-                    {"unknownChunkIds": sorted(chunk_ids - valid_chunk_ids)},
-                )
-            row = EvaluationQuery(
-                project_id=project_id,
-                query=request.query,
-                dataset_version=request.dataset_version,
-                notes=request.notes,
-            )
-            row.relevant_chunks = [
-                RelevantChunk(chunk_id=str(chunk_id)) for chunk_id in request.relevant_chunk_ids
-            ]
-            session.add(row)
-            session.flush()
-            return {
-                "id": row.id,
-                "query": row.query,
-                "datasetVersion": row.dataset_version,
-                "relevantChunkIds": [str(item) for item in request.relevant_chunk_ids],
-                "notes": row.notes,
-            }
+            return add_eval_query(session, project_id, request)
 
     @app.get("/api/v1/projects/{project_id}/evaluation-queries/export")
     def export_eval_queries(project_id: str, dataset_version: int = 1) -> dict[str, Any]:
@@ -613,13 +797,15 @@ def create_app(
 
     @app.post("/api/v1/projects/{project_id}/evaluation-queries/import", status_code=201)
     def import_eval_queries(project_id: str, request: EvaluationDatasetImport) -> dict[str, Any]:
-        created = [
-            create_eval_query(
-                project_id,
-                query.model_copy(update={"dataset_version": request.dataset_version}),
-            )
-            for query in request.queries
-        ]
+        with state.factory.begin() as session:
+            created = [
+                add_eval_query(
+                    session,
+                    project_id,
+                    query.model_copy(update={"dataset_version": request.dataset_version}),
+                )
+                for query in request.queries
+            ]
         return {"schema": "contextbench.evaluation.v1", "imported": len(created)}
 
     @app.get("/api/v1/projects/{project_id}/experiments")
@@ -627,7 +813,11 @@ def create_app(
         with state.factory() as session:
             project_or_error(session, project_id)
             rows = list(
-                session.scalars(select(Experiment).where(Experiment.project_id == project_id))
+                session.scalars(
+                    select(Experiment)
+                    .where(Experiment.project_id == project_id)
+                    .order_by(Experiment.created_at.desc())
+                )
             )
         return {
             "data": [
@@ -643,37 +833,47 @@ def create_app(
             config = session.get(IndexConfiguration, str(request.index_configuration_id))
             if config is None or config.project_id != project_id:
                 raise APIError("NOT_FOUND", "Index configuration not found.", 404)
-            experiment = Experiment(
-                project_id=project_id,
-                name=request.name,
-                config_json=request.model_dump(mode="json", by_alias=True)
-                | {"indexSnapshot": _index_response(config)},
-                status="RUNNING",
-            )
-            session.add(experiment)
-            session.flush()
-            chunks = chunks_for_index(session, config.id)
             if request.method is RetrievalMethod.RERANKED and request.reranker is None:
                 raise APIError(
                     "RERANKER_REQUIRED",
                     "A reranker configuration is required for a reranked experiment.",
                     422,
                 )
-            engine = RetrievalEngine(
-                state.store,
-                state.embedder(config),
-                reranker=state.reranker(request.reranker),
-            )
+            chunks = chunks_for_index(session, config.id)
             queries = list(
                 session.scalars(
-                    select(EvaluationQuery).where(
+                    select(EvaluationQuery)
+                    .where(
                         EvaluationQuery.project_id == project_id,
                         EvaluationQuery.dataset_version == request.dataset_version,
                     )
+                    .order_by(EvaluationQuery.id)
                 )
             )
+            snapshot = _dataset_snapshot(session, queries, request.dataset_version)
+            experiment = Experiment(
+                project_id=project_id,
+                name=request.name,
+                config_json=request.model_dump(mode="json", by_alias=True)
+                | {
+                    "indexSnapshot": _index_response(config) | _chunk_snapshot(chunks),
+                    "datasetSnapshot": snapshot,
+                    "evaluatedQueryIds": [],
+                },
+                status="RUNNING",
+            )
+            session.add(experiment)
+            session.flush()
+            reranker = state.reranker(request.reranker)
+            engine = RetrievalEngine(
+                state.store,
+                state.embedder(config),
+                reranker=reranker,
+            )
+            evaluated_query_ids: list[str] = []
             for query_row in queries:
-                relevant_ids = {item.chunk_id for item in query_row.relevant_chunks}
+                judged_ids = {item.chunk_id for item in query_row.relevant_chunks}
+                relevant_ids = _mapped_relevant_ids(session, query_row, chunks)
                 if not relevant_ids:
                     continue
                 try:
@@ -706,9 +906,29 @@ def create_app(
                     ExperimentResult(
                         evaluation_query_id=query_row.id,
                         metrics_json=metrics,
-                        rankings_json={"method": request.method.value, "chunkIds": ranked_ids},
+                        rankings_json={
+                            "query": query_row.query,
+                            "method": request.method.value,
+                            "judgedChunkIds": sorted(judged_ids),
+                            "resolvedRelevantChunkIds": sorted(relevant_ids),
+                            "chunkIds": ranked_ids,
+                            "latenciesMs": result.latencies_ms,
+                            "contextMethod": result.context_method.value,
+                        },
                     )
                 )
+                evaluated_query_ids.append(query_row.id)
+            experiment.config_json = experiment.config_json | {
+                "evaluatedQueryIds": evaluated_query_ids,
+                "rerankerSnapshot": (
+                    {
+                        "model": request.reranker.model,
+                        "revision": reranker.resolved_revision,
+                    }
+                    if request.reranker is not None and reranker is not None
+                    else None
+                ),
+            }
             experiment.status = "COMPLETED"
             experiment.executed_at = utc_now()
             return {
@@ -725,18 +945,13 @@ def create_app(
             experiment = session.get(Experiment, experiment_id)
             if experiment is None:
                 raise APIError("NOT_FOUND", "Experiment not found.", 404)
-            aggregate: dict[str, list[float]] = {}
-            for result in experiment.results:
-                for key, value in result.metrics_json.items():
-                    aggregate.setdefault(key, []).append(float(value))
-            metrics = {
-                key: sum(values) / len(values) for key, values in aggregate.items() if values
-            }
+            metrics = _aggregate_experiment_metrics(experiment)
             return {
                 "id": experiment.id,
                 "name": experiment.name,
                 "status": experiment.status,
                 "configuration": experiment.config_json,
+                "executedAt": experiment.executed_at,
                 "metrics": metrics,
                 "results": [
                     {
@@ -758,6 +973,9 @@ def create_app(
                 "id": experiment.id,
                 "name": experiment.name,
                 "status": experiment.status,
+                "executedAt": experiment.executed_at.isoformat()
+                if experiment.executed_at
+                else None,
                 "configuration": experiment.config_json,
                 "results": [
                     {
@@ -771,26 +989,35 @@ def create_app(
         return JSONResponse(content=json.loads(export_experiment(payload)))
 
     @app.post("/api/v1/experiments/compare")
-    def compare(request: dict[str, Any]) -> dict[str, Any]:
-        ids = request.get("experimentIds", [])
+    def compare(request: ExperimentComparisonRequest) -> dict[str, Any]:
         with state.factory() as session:
             experiments: list[dict[str, Any]] = []
-            for experiment_id in ids:
+            compatibility: tuple[str, str, tuple[str, ...]] | None = None
+            for experiment_id in request.experiment_ids:
                 experiment = session.get(Experiment, str(experiment_id))
                 if experiment is None:
                     raise APIError("NOT_FOUND", "Experiment not found.", 404)
-                aggregate: dict[str, list[float]] = {}
-                for result in experiment.results:
-                    for key, value in result.metrics_json.items():
-                        aggregate.setdefault(key, []).append(float(value))
+                dataset_digest = str(
+                    experiment.config_json.get("datasetSnapshot", {}).get("digest", "")
+                )
+                evaluated_ids = tuple(experiment.config_json.get("evaluatedQueryIds", []))
+                signature = (experiment.project_id, dataset_digest, evaluated_ids)
+                if not dataset_digest or (compatibility is not None and signature != compatibility):
+                    raise APIError(
+                        "INCOMPATIBLE_EXPERIMENTS",
+                        "Experiments must share one project and frozen evaluation dataset.",
+                        422,
+                    )
+                compatibility = signature
                 experiments.append(
                     {
                         "name": experiment.name,
-                        "metrics": {
-                            key: sum(values) / len(values)
-                            for key, values in aggregate.items()
-                            if values
+                        "configuration": {
+                            "method": experiment.config_json.get("method"),
+                            "indexSnapshot": experiment.config_json.get("indexSnapshot"),
+                            "datasetDigest": dataset_digest,
                         },
+                        "metrics": _aggregate_experiment_metrics(experiment),
                     }
                 )
         try:
@@ -810,6 +1037,19 @@ def create_app(
                 "generated": False,
                 "reason": "INSUFFICIENT_EVIDENCE",
             }
+        ignored_terms = {"what", "when", "where", "which", "who", "why", "how", "does"}
+        query_terms = {
+            term
+            for term in tokenize(request.question)
+            if len(term) >= 3 and term not in ignored_terms
+        }
+        evidence_terms = set(tokenize(request.context))
+        if query_terms and len(query_terms & evidence_terms) < request.minimum_query_term_matches:
+            return {
+                "answer": "Retrieved evidence appears insufficient to answer this question.",
+                "generated": False,
+                "reason": "INSUFFICIENT_QUERY_OVERLAP",
+            }
         try:
             answer = OllamaClient(request.base_url, request.model).answer(
                 request.question, request.context
@@ -823,6 +1063,26 @@ def create_app(
             if answer != "I do not have enough cited evidence."
             else "CITATIONS_MISSING",
         }
+
+    built_frontend = (
+        Path(frontend_dir)
+        if frontend_dir is not None
+        else Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    )
+    if (built_frontend / "index.html").is_file():
+        assets = built_frontend / "assets"
+        if assets.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets), name="frontend-assets")
+
+        @app.get("/{path:path}", include_in_schema=False)
+        def frontend(path: str) -> FileResponse:
+            if path.startswith("api/"):
+                raise APIError("NOT_FOUND", "API endpoint not found.", 404)
+            candidate = (built_frontend / path).resolve()
+            root = built_frontend.resolve()
+            if candidate.is_file() and (candidate == root or root in candidate.parents):
+                return FileResponse(candidate)
+            return FileResponse(root / "index.html")
 
     return app
 

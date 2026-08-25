@@ -9,5 +9,6 @@ parameters and Apache 2.0 licensing. It was trained for passage ranking:
 [model card](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2).
 
 Reranker scores only order candidates from that run. They are not calibrated answer confidence.
-If the model is absent, retrieval and evaluation continue without reranking. ContextBench does not
-download it without explicit approval.
+Retrieval and evaluation work with reranking disabled. A request that explicitly selects reranking
+returns `MODEL_DOWNLOAD_REQUIRED` when the model is absent. ContextBench does not download it
+without explicit approval. Completed reranked experiments store the resolved model revision.

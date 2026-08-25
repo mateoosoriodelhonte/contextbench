@@ -10,11 +10,12 @@ from typing import cast
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from .config import DEFAULT_DATABASE_PATH
 from .models import Base, Document, Project
 
 
 def create_session_factory(
-    path: str | Path = ".contextbench/contextbench.sqlite3",
+    path: str | Path = DEFAULT_DATABASE_PATH,
 ) -> sessionmaker[Session]:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

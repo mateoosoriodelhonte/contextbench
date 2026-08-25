@@ -1,6 +1,6 @@
 {
   "schema": "contextbench.benchmark.v1",
-  "measuredAt": "2026-08-25T21:46:51.015269+00:00",
+  "measuredAt": "2026-08-25T22:13:36.726664+00:00",
   "environment": {
     "python": "3.12.13",
     "platform": "macOS-26.5.2-arm64-arm-64bit",
@@ -13,11 +13,11 @@
     "dimension": 64
   },
   "measurements": {
-    "embeddingDocumentsPerSecond": 127503.60719208943,
-    "indexingMs": 91.65054187178612,
-    "vectorQueryMedianMs": 1.052770996466279,
-    "bm25QueryMedianMs": 0.9493335383012891,
-    "hybridQueryMedianMs": 1.9560209475457668,
+    "embeddingDocumentsPerSecond": 120848.97957805518,
+    "indexingMs": 73.27583408914506,
+    "vectorQueryMedianMs": 1.0231244377791882,
+    "bm25QueryMedianMs": 0.9527085348963737,
+    "hybridQueryMedianMs": 1.9545418908819556,
     "rerank": {
       "status": "NOT_RUN",
       "reason": "No model download in the default benchmark."

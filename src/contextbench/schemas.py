@@ -69,6 +69,7 @@ class EmbeddingConfig(CBModel):
 
 class RerankerConfig(CBModel):
     model: str = "cross-encoder/ms-marco-MiniLM-L6-v2"
+    revision: str | None = Field(default=None, max_length=200)
     allow_model_download: bool = False
 
 
@@ -134,7 +135,7 @@ class EvaluationQueryRequest(CBModel):
 class EvaluationDatasetImport(CBModel):
     schema_name: Literal["contextbench.evaluation.v1"] = Field(alias="schema")
     dataset_version: int = Field(default=1, ge=1)
-    queries: list[EvaluationQueryRequest] = Field(min_length=1, max_length=10000)
+    queries: list[EvaluationQueryRequest] = Field(min_length=1, max_length=1000)
 
 
 class GenerateRequest(CBModel):
@@ -143,6 +144,7 @@ class GenerateRequest(CBModel):
     model: str = Field(default="llama3.2", min_length=1, max_length=200)
     base_url: str = Field(default="http://127.0.0.1:11434", max_length=2048)
     minimum_evidence_tokens: int = Field(default=20, ge=1, le=10000)
+    minimum_query_term_matches: int = Field(default=1, ge=0, le=100)
 
 
 class ExperimentRequest(CBModel):
@@ -159,6 +161,10 @@ class ExperimentRequest(CBModel):
         if not value or any(k < 1 or k > 1000 for k in value):
             raise ValueError("kValues must contain positive values")
         return sorted(set(value))
+
+
+class ExperimentComparisonRequest(CBModel):
+    experiment_ids: list[UUID] = Field(min_length=2, max_length=20)
 
 
 class Pagination(CBModel):

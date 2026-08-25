@@ -46,5 +46,11 @@ nDCG@K = DCG@K / IDCG@K
 `IDCG@K` is the DCG of an ideal ranking with `min(|R|, k)` relevant chunks first. nDCG is 0 when
 the returned ranking has no gain. An unjudged query is excluded from the aggregate.
 
-Metrics are macro means across judged queries. Per-query values stay in the experiment export so
-one failure cannot be hidden by the average.
+The saved chunk IDs anchor judgments to normalized document spans. When an experiment uses another
+index configuration, ContextBench maps each anchor to chunks that overlap the same document span.
+It stores the resolved relevant IDs in the experiment. This makes chunk-size comparisons valid
+without pretending that independently generated chunk IDs match.
+
+Metrics are macro means across judged queries. Per-query values, resolved relevance IDs, frozen
+dataset digest, index digest, and latency stay in the experiment export so one failure cannot be
+hidden by the average.
