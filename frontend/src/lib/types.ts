@@ -28,6 +28,7 @@ export interface Project {
   indexCount: number;
   updatedAt: string;
   status: "READY" | "INGESTING" | "ERROR";
+  createdAt: string;
 }
 
 export interface ProjectOverview extends Project {
@@ -46,15 +47,29 @@ export interface Document {
   chunkCount: number;
   status: "READY" | "PROCESSING" | "ERROR";
   updatedAt: string;
+  sha256: string;
 }
 
 export interface IndexConfiguration {
   id: string;
   name: string;
-  chunkSize: number;
-  overlap: number;
-  embeddingModel: string;
-  dimension: number;
+  projectId: string;
+  chunking: {
+    strategy: "FIXED_TOKEN" | "PARAGRAPH" | "HEADING";
+    chunkSize: number;
+    overlap: number;
+  };
+  embedding: {
+    provider: "hash" | "sentence-transformers";
+    model: string;
+    revision?: string;
+    dimension: number;
+    normalize: boolean;
+    allowModelDownload: boolean;
+  };
+  vectorDimension: number;
+  vectorCount: number;
+  indexingMs: number;
   status: "READY" | "BUILDING" | "ERROR";
   createdAt: string;
 }
@@ -66,6 +81,11 @@ export interface Chunk {
   text: string;
   ordinal: number;
   tokenCount: number;
+  startChar: number;
+  endChar: number;
+  heading?: string;
+  page?: number;
+  indexConfigurationId?: string;
 }
 
 export interface RetrievalRequest {
@@ -80,6 +100,10 @@ export interface RetrievalRequest {
     tags: string[];
   };
   maxContextTokens: number;
+  reranker?: {
+    model: string;
+    allowModelDownload: boolean;
+  };
 }
 
 export interface RetrievalHit {
@@ -103,8 +127,9 @@ export interface RetrievalResponse {
   query: string;
   lanes: RetrievalLane[];
   stageLatency: {
-    tokenizeMs: number;
-    retrieveMs: number;
+    vectorMs: number;
+    bm25Ms: number;
+    fusionMs: number;
     rerankMs: number;
     assembleMs: number;
     totalMs: number;
@@ -117,7 +142,8 @@ export interface RetrievalResponse {
 export interface EvaluationQuery {
   id: string;
   query: string;
-  relevantDocumentIds: string[];
+  relevantChunkIds: string[];
+  notes?: string;
   datasetVersion: number;
   createdAt: string;
 }
@@ -125,14 +151,21 @@ export interface EvaluationQuery {
 export interface Experiment {
   id: string;
   name: string;
-  method: RetrievalMethod;
-  datasetVersion: number;
-  indexConfigurationId: string;
-  status: "QUEUED" | "RUNNING" | "COMPLETE" | "ERROR";
+  method?: RetrievalMethod;
+  datasetVersion?: number;
+  indexConfigurationId?: string;
+  status: "QUEUED" | "RUNNING" | "COMPLETED" | "ERROR";
   createdAt: string;
 }
 
 export interface ExperimentComparison {
-  experiments: Array<{ id: string; name: string; method: RetrievalMethod }>;
-  metrics: Array<{ name: string; values: number[]; higherIsBetter: boolean }>;
+  schema: "contextbench.experiment.v1";
+  experiments: Array<{ name: string; metrics: Record<string, number> }>;
+  metricKeys: string[];
+}
+
+export interface DemoSetup {
+  projectId: string;
+  indexConfigurationId: string;
+  reused: boolean;
 }

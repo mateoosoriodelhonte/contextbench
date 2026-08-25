@@ -1,5 +1,6 @@
 import type {
   Chunk,
+  DemoSetup,
   Document,
   EvaluationQuery,
   Experiment,
@@ -8,6 +9,7 @@ import type {
   ListResponse,
   Project,
   ProjectOverview,
+  RetrievalMethod,
   RetrievalRequest,
   RetrievalResponse,
 } from "./types";
@@ -16,7 +18,11 @@ export class ContextBenchApiError extends Error {
   readonly code: string;
   readonly details: Record<string, unknown>;
 
-  constructor(message: string, code = "REQUEST_FAILED", details: Record<string, unknown> = {}) {
+  constructor(
+    message: string,
+    code = "REQUEST_FAILED",
+    details: Record<string, unknown> = {},
+  ) {
     super(message);
     this.name = "ContextBenchApiError";
     this.code = code;
@@ -32,18 +38,29 @@ export class ContextBenchApi {
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const isFormData =
+      typeof FormData !== "undefined" && init?.body instanceof FormData;
     const response = await fetch(`${this.baseUrl}${path}`, {
       ...init,
       headers: {
         Accept: "application/json",
-        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...(init?.body && !isFormData
+          ? { "Content-Type": "application/json" }
+          : {}),
         ...init?.headers,
       },
     });
-    const payload = (await response.json()) as T & { error?: { code?: string; message?: string; details?: Record<string, unknown> } };
+    const payload = (await response.json()) as T & {
+      error?: {
+        code?: string;
+        message?: string;
+        details?: Record<string, unknown>;
+      };
+    };
     if (!response.ok) {
       throw new ContextBenchApiError(
-        payload.error?.message ?? `Request failed with status ${response.status}.`,
+        payload.error?.message ??
+          `Request failed with status ${response.status}.`,
         payload.error?.code,
         payload.error?.details,
       );
@@ -55,35 +72,135 @@ export class ContextBenchApi {
     return this.request("/api/v1/projects");
   }
 
+  createProject(name: string, description?: string): Promise<Project> {
+    return this.request("/api/v1/projects", {
+      method: "POST",
+      body: JSON.stringify({ name, description: description || null }),
+    });
+  }
+
   getProject(projectId: string): Promise<ProjectOverview> {
     return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}`);
   }
 
   listDocuments(projectId: string): Promise<ListResponse<Document>> {
-    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/documents`);
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/documents`,
+    );
   }
 
-  listIndexes(projectId: string): Promise<ListResponse<IndexConfiguration>> {
-    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/indexes`);
+  uploadDocument(projectId: string, file: File, tags = ""): Promise<Document> {
+    const body = new FormData();
+    body.append("file", file);
+    body.append("tags", tags);
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/documents`,
+      { method: "POST", body },
+    );
   }
 
-  listChunks(documentId: string): Promise<ListResponse<Chunk>> {
-    return this.request(`/api/v1/documents/${encodeURIComponent(documentId)}/chunks`);
+  listIndexes(projectId: string): Promise<{ data: IndexConfiguration[] }> {
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/indexes`,
+    );
   }
 
-  retrieve(projectId: string, request: RetrievalRequest): Promise<RetrievalResponse> {
-    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/retrieve`, {
-      method: "POST",
-      body: JSON.stringify(request),
-    });
+  createIndex(
+    projectId: string,
+    request: {
+      name: string;
+      chunking: { strategy: string; chunkSize: number; overlap: number };
+      embedding: {
+        provider: string;
+        model: string;
+        dimension: number;
+        normalize: boolean;
+        allowModelDownload: boolean;
+      };
+    },
+  ): Promise<IndexConfiguration & { chunkCount: number }> {
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/indexes`,
+      { method: "POST", body: JSON.stringify(request) },
+    );
   }
 
-  listEvaluationQueries(projectId: string): Promise<ListResponse<EvaluationQuery>> {
-    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/evaluation-queries`);
+  listChunks(
+    documentId: string,
+    indexConfigurationId?: string,
+  ): Promise<ListResponse<Chunk>> {
+    const query = indexConfigurationId
+      ? `?index_configuration_id=${encodeURIComponent(indexConfigurationId)}`
+      : "";
+    return this.request(
+      `/api/v1/documents/${encodeURIComponent(documentId)}/chunks${query}`,
+    );
   }
 
-  listExperiments(projectId: string): Promise<ListResponse<Experiment>> {
-    return this.request(`/api/v1/projects/${encodeURIComponent(projectId)}/experiments`);
+  retrieve(
+    projectId: string,
+    request: RetrievalRequest,
+  ): Promise<RetrievalResponse> {
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/retrieve`,
+      { method: "POST", body: JSON.stringify(request) },
+    );
+  }
+
+  listEvaluationQueries(
+    projectId: string,
+  ): Promise<{ data: EvaluationQuery[] }> {
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/evaluation-queries`,
+    );
+  }
+
+  createEvaluationQuery(
+    projectId: string,
+    request: {
+      query: string;
+      relevantChunkIds: string[];
+      datasetVersion: number;
+      notes?: string;
+    },
+  ): Promise<EvaluationQuery> {
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/evaluation-queries`,
+      { method: "POST", body: JSON.stringify(request) },
+    );
+  }
+
+  listExperiments(projectId: string): Promise<{ data: Experiment[] }> {
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/experiments`,
+    );
+  }
+
+  createExperiment(
+    projectId: string,
+    request: {
+      name: string;
+      datasetVersion: number;
+      indexConfigurationId: string;
+      method: RetrievalMethod;
+      kValues: number[];
+    },
+  ): Promise<Experiment & { resultCount: number }> {
+    return this.request(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/experiments`,
+      { method: "POST", body: JSON.stringify(request) },
+    );
+  }
+
+  getExperiment(experimentId: string): Promise<{
+    id: string;
+    name: string;
+    status: string;
+    metrics: Record<string, number>;
+  }> {
+    return this.request(
+      `/api/v1/experiments/${encodeURIComponent(experimentId)}`,
+    );
   }
 
   compareExperiments(experimentIds: string[]): Promise<ExperimentComparison> {
@@ -91,5 +208,9 @@ export class ContextBenchApi {
       method: "POST",
       body: JSON.stringify({ experimentIds }),
     });
+  }
+
+  createDemo(): Promise<DemoSetup> {
+    return this.request("/api/v1/demo", { method: "POST" });
   }
 }

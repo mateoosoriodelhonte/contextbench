@@ -17,9 +17,10 @@ node_modules/
 frontend/dist/
 frontend/playwright-report/
 frontend/test-results/
+*.tsbuildinfo
 .contextbench/
+.e2e/
 data/
 *.db
 *.sqlite
 *.sqlite3
-

@@ -45,10 +45,18 @@ describe("ContextBenchApi", () => {
 
   it("surfaces contract errors without exposing raw response internals", async () => {
     vi.mocked(fetch).mockResolvedValue(
-      new Response(JSON.stringify({ error: { code: "VALIDATION_ERROR", message: "The query is required." } }), {
-        status: 422,
-        headers: { "Content-Type": "application/json" },
-      }),
+      new Response(
+        JSON.stringify({
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "The query is required.",
+          },
+        }),
+        {
+          status: 422,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
     );
 
     const api = new ContextBenchApi("http://localhost:8000");
