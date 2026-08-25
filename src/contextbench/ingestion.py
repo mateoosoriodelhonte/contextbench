@@ -1,0 +1,83 @@
+"""Safe local document ingestion."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+from dataclasses import dataclass
+from pathlib import Path
+
+from pypdf import PdfReader
+
+from .chunking import normalize_text
+from .schemas import SourceType
+
+MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
+ALLOWED_SUFFIXES = {".txt": SourceType.TXT, ".md": SourceType.MD, ".markdown": SourceType.MD}
+SOURCE_SUFFIXES = {
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".java",
+    ".go",
+    ".rs",
+    ".sql",
+    ".json",
+    ".yaml",
+    ".yml",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class IngestedDocument:
+    filename: str
+    source_type: SourceType
+    text: str
+    sha256: str
+    metadata: dict[str, str]
+
+
+class IngestionError(ValueError):
+    pass
+
+
+def ingest_bytes(
+    filename: str, data: bytes, *, max_bytes: int = MAX_DOCUMENT_BYTES
+) -> IngestedDocument:
+    if not filename or Path(filename).name != filename:
+        raise IngestionError("filename must be a plain file name")
+    if len(data) > max_bytes:
+        raise IngestionError("document exceeds the maximum size")
+    suffix = Path(filename).suffix.lower()
+    if suffix in ALLOWED_SUFFIXES:
+        source_type = ALLOWED_SUFFIXES[suffix]
+        text = data.decode("utf-8-sig", errors="strict")
+    elif suffix == ".pdf":
+        source_type = SourceType.PDF
+        try:
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception as exc:
+            raise IngestionError("invalid PDF document") from exc
+    elif suffix in SOURCE_SUFFIXES:
+        source_type = SourceType.SOURCE
+        text = data.decode("utf-8-sig", errors="strict")
+    else:
+        raise IngestionError("unsupported document type")
+    text = normalize_text(text)
+    if not text:
+        raise IngestionError("document has no extractable text")
+    return IngestedDocument(filename, source_type, text, hashlib.sha256(data).hexdigest(), {})
+
+
+def ingest_path(path: str | Path, *, allowed_root: str | Path | None = None) -> IngestedDocument:
+    candidate = Path(path).resolve()
+    if allowed_root is not None:
+        root = Path(allowed_root).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise IngestionError("path is outside the allowed root")
+    if not candidate.is_file():
+        raise IngestionError("document path is not a file")
+    return ingest_bytes(candidate.name, candidate.read_bytes())
