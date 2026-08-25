@@ -17,4 +17,3 @@ This project follows Semantic Versioning. Dates use ISO 8601.
 ### Security
 
 - Local-only bind, upload limits, safe text rendering, prompt boundary rules, and no telemetry.
-

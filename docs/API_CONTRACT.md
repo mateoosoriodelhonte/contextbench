@@ -1,7 +1,8 @@
 # ContextBench API contract
 
 The local API is versioned under `/api/v1`. JSON fields use `camelCase`. UUID strings are
-opaque identifiers. All timestamps use UTC ISO 8601. List responses use:
+opaque identifiers. All timestamps use UTC ISO 8601. Paginated project, document, and chunk
+lists use:
 
 ```json
 {
@@ -14,6 +15,9 @@ opaque identifiers. All timestamps use UTC ISO 8601. List responses use:
   }
 }
 ```
+
+Index, evaluation-query, and experiment lists use `{"data": []}` because V1 does not paginate
+those smaller project-scoped collections.
 
 Errors use one shape:
 
@@ -29,20 +33,23 @@ Errors use one shape:
 
 ## Resources
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/health` | Process and storage health. |
-| `GET`, `POST` | `/api/v1/projects` | List or create projects. |
-| `GET` | `/api/v1/projects/{projectId}` | Project dashboard and latest metrics. |
-| `GET`, `POST` | `/api/v1/projects/{projectId}/documents` | List documents or ingest one multipart file. |
-| `GET` | `/api/v1/documents/{documentId}/chunks` | Paginated, inspectable chunks. |
-| `GET`, `POST` | `/api/v1/projects/{projectId}/indexes` | List or build an index configuration. |
-| `POST` | `/api/v1/projects/{projectId}/retrieve` | Run vector, BM25, hybrid, and optional reranked retrieval. |
-| `GET`, `POST` | `/api/v1/projects/{projectId}/evaluation-queries` | List or create relevance judgments. |
-| `GET`, `POST` | `/api/v1/projects/{projectId}/experiments` | List or execute experiments. |
-| `GET` | `/api/v1/experiments/{experimentId}` | Frozen configuration and per-query results. |
-| `POST` | `/api/v1/experiments/compare` | Compare two or more real experiment results. |
-| `POST` | `/api/v1/demo` | Create or reuse the deterministic demo project. |
+| Method        | Path                                                     | Purpose                                                    |
+| ------------- | -------------------------------------------------------- | ---------------------------------------------------------- |
+| `GET`         | `/health`                                                | Process and storage health.                                |
+| `GET`, `POST` | `/api/v1/projects`                                       | List or create projects.                                   |
+| `GET`         | `/api/v1/projects/{projectId}`                           | Project dashboard and latest metrics.                      |
+| `GET`, `POST` | `/api/v1/projects/{projectId}/documents`                 | List documents or ingest one multipart file.               |
+| `GET`         | `/api/v1/documents/{documentId}/chunks`                  | Paginated, inspectable chunks.                             |
+| `GET`, `POST` | `/api/v1/projects/{projectId}/indexes`                   | List or build an index configuration.                      |
+| `POST`        | `/api/v1/projects/{projectId}/retrieve`                  | Run vector, BM25, hybrid, and optional reranked retrieval. |
+| `GET`, `POST` | `/api/v1/projects/{projectId}/evaluation-queries`        | List or create relevance judgments.                        |
+| `GET`         | `/api/v1/projects/{projectId}/evaluation-queries/export` | Export one dataset version.                                |
+| `POST`        | `/api/v1/projects/{projectId}/evaluation-queries/import` | Import a versioned dataset.                                |
+| `GET`, `POST` | `/api/v1/projects/{projectId}/experiments`               | List or execute experiments.                               |
+| `GET`         | `/api/v1/experiments/{experimentId}`                     | Frozen configuration and per-query results.                |
+| `POST`        | `/api/v1/experiments/compare`                            | Compare two or more real experiment results.               |
+| `POST`        | `/api/v1/demo`                                           | Create or reuse the deterministic demo project.            |
+| `POST`        | `/api/v1/generate`                                       | Ask an existing loopback Ollama model for a cited answer.  |
 
 ## Retrieval request
 
@@ -58,7 +65,11 @@ Errors use one shape:
     "sourceTypes": [],
     "tags": []
   },
-  "maxContextTokens": 1200
+  "maxContextTokens": 1200,
+  "reranker": {
+    "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+    "allowModelDownload": false
+  }
 }
 ```
 
@@ -80,15 +91,18 @@ contains measured stage latency and the exact deterministically trimmed final co
   "embedding": {
     "provider": "sentence-transformers",
     "model": "BAAI/bge-small-en-v1.5",
+    "revision": null,
+    "dimension": 384,
     "normalize": true,
     "allowModelDownload": false
   }
 }
 ```
 
-The server returns `MODEL_DOWNLOAD_REQUIRED` before a model download unless the request or
-CLI command explicitly allows it. An index freezes provider, model, revision, vector
-dimension, normalization, chunking, and vector distance. Changing one creates a new index.
+The server returns `MODEL_DOWNLOAD_REQUIRED` before a model download unless the request explicitly
+allows it. The stored configuration clears that one-time consent after a successful build. An
+index freezes provider, model, requested revision, actual vector dimension, normalization,
+chunking, and vector distance. Changing one creates a new index.
 
 ## Experiment request
 
@@ -105,4 +119,3 @@ dimension, normalization, chunking, and vector distance. Changing one creates a 
 
 An experiment is immutable after execution. Its export schema is
 `contextbench.experiment.v1`.
-

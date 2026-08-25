@@ -12,4 +12,3 @@ and its contributors.
 Report conduct problems through a private message to the repository owner. Include links or
 screenshots that show the event. The owner will limit disclosure to people needed to review the
 report and will state any conflict that prevents an impartial decision.
-

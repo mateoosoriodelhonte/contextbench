@@ -23,4 +23,3 @@ Optional Ollama prompts separate system instructions, user questions, and quoted
 
 Keep FastAPI, Starlette, `python-multipart`, pypdf, Qdrant, and frontend packages patched. File
 parsing and multipart handling are security-sensitive dependency paths.
-

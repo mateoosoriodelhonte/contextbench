@@ -48,4 +48,3 @@ the returned ranking has no gain. An unjudged query is excluded from the aggrega
 
 Metrics are macro means across judged queries. Per-query values stay in the experiment export so
 one failure cannot be hidden by the average.
-

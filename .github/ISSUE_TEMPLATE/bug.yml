@@ -38,4 +38,3 @@ body:
       description: Operating system, Python, Node, embedding provider, and CPU or accelerator.
     validations:
       required: true
-

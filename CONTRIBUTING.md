@@ -6,7 +6,7 @@ score, or model default.
 
 ## Local checks
 
-Install Python 3.12 and Node 20 or newer. The project uses `uv` and npm lockfiles.
+Install Python 3.12 and Node 22 or newer. The project uses `uv` and npm lockfiles.
 
 ```bash
 uv sync --extra dev
@@ -16,12 +16,13 @@ uv run mypy src
 uv run pytest
 
 cd frontend
-npm ci
+npm ci --ignore-scripts
 npm run format:check
 npm run lint
 npm run typecheck
 npm test
 npm run build
+npm run e2e
 ```
 
 Run Playwright when a user flow changes. Do not add a required cloud service or paid API. Tests
@@ -36,4 +37,3 @@ Use a closing keyword only when the pull request meets every acceptance criterio
 
 Commit messages use `feat:`, `fix:`, `test:`, `docs:`, `refactor:`, or `chore:` followed by a short
 reason for the change.
-

@@ -9,11 +9,9 @@ Transformers models live in the local Hugging Face cache. Installing or download
 contacts the package or model host; ContextBench requires explicit approval before the first model
 download. After the files are cached, embedding and reranking run locally.
 
-Optional Ollama use sends the selected question and context to the configured Ollama HTTP
-endpoint. The default endpoint is loopback. A user who changes it to a remote host is responsible
-for that host's storage and network behavior.
+Optional Ollama use sends the selected question and context only to a configured
+`127.0.0.1` or `localhost` HTTP endpoint. ContextBench rejects a remote Ollama URL.
 
-Deleting a project through the supported application action removes its SQLite records and
-rebuildable Qdrant collection. Backups, filesystem snapshots, and model caches are outside that
-action.
-
+Users can remove the `.contextbench/` directory when the application is stopped to delete all
+project records and rebuildable vector collections. Backups, filesystem snapshots, and model
+caches are separate.

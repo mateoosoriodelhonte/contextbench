@@ -41,4 +41,3 @@ Compaction merges runs, removes overwritten values, and restores bounds on read 
 Compaction trades background write work for cheaper future reads. Size-tiered compaction writes
 less data during ingestion but can leave more runs to search. Leveled compaction limits overlap
 between runs but rewrites data more often.
-

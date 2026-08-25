@@ -11,4 +11,3 @@ parameters and Apache 2.0 licensing. It was trained for passage ranking:
 Reranker scores only order candidates from that run. They are not calibrated answer confidence.
 If the model is absent, retrieval and evaluation continue without reranking. ContextBench does not
 download it without explicit approval.
-

@@ -35,4 +35,3 @@ must fail rather than silently selecting one request.
 Retries need backoff and a limit. Immediate retries can add load to a service that is already
 failing. Exponential backoff spreads attempts over time, and random jitter keeps many clients
 from retrying on the same schedule.
-

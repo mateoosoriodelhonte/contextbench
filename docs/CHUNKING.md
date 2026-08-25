@@ -12,19 +12,17 @@ heading from its body.
 
 ## Paragraph aware
 
-The paragraph-aware strategy adds complete paragraphs until the next paragraph would exceed the
-target. One paragraph can exceed the target when splitting it would lose the chosen semantic
-boundary. Source ranges include the whitespace between retained paragraphs.
+The paragraph-aware strategy makes one normalized paragraph per chunk. It does not split a long
+paragraph in V1. This choice makes the semantic boundary and its tradeoff easy to inspect.
 
 ## Heading aware
 
-The heading-aware strategy treats Markdown-style headings as section metadata. It groups section
-text to the target size and copies the nearest heading path into each chunk. A heading is metadata,
-not an instruction to the retrieval or generation system.
+The heading-aware strategy treats Markdown-style headings as section metadata. It makes one chunk
+from the body under each heading and copies the nearest heading into that chunk. A heading is
+metadata, not an instruction to the retrieval or generation system.
 
 ## Provenance
 
 Every chunk records the source document, zero-based chunk index, page when known, heading when
-known, original character start/end, estimated token start/end, and normalized content. The UI
-shows these fields with every result.
-
+known, normalized character start/end, token count, and normalized content. The UI shows these
+fields with every result.

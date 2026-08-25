@@ -18,4 +18,3 @@ Refs #
 
 State what this pull request does not change. Name any skipped check and the proof that will replace
 it.
-

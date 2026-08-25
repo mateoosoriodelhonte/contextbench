@@ -47,4 +47,3 @@ separated from a newer leader. A read-index protocol confirms contact with a maj
 current term before the state machine serves a linearizable read. A lease can reduce the number
 of messages, but it depends on bounded clock behavior and requires a carefully stated timing
 assumption.
-

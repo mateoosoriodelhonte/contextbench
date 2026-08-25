@@ -27,7 +27,8 @@ reciprocal rank fusion.
 - Qdrant local mode does not provide server snapshot operations. ContextBench treats indexes
   as rebuildable artifacts from SQLite documents and frozen configurations.
 - SQLite and Qdrant require consistency checks. Index build status changes only after a full
-  vector upsert succeeds; failed builds remain inspectable and rebuildable.
+  vector upsert succeeds. A failed new build returns an error and rolls back its SQLite records;
+  existing index configurations remain usable.
 
 ## Alternatives
 
@@ -37,4 +38,3 @@ reciprocal rank fusion.
   application work.
 - A Qdrant Docker service provides stronger operational parity but adds a required service to a
   local-first V1.
-
