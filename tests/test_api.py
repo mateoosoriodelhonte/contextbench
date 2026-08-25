@@ -1,13 +1,21 @@
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 
 from contextbench.api import create_app
+from contextbench.db import create_session_factory
+from contextbench.models import RetrievalRun
 
 
 def test_project_ingest_index_and_retrieve(tmp_path) -> None:
-    client = TestClient(create_app(tmp_path / "db.sqlite", tmp_path / "vectors"))
+    db_path = tmp_path / "db.sqlite"
+    client = TestClient(create_app(db_path, tmp_path / "vectors"))
     response = client.post("/api/v1/projects", json={"name": "Test"})
     assert response.status_code == 201
-    project_id = response.json()["id"]
+    created_project = response.json()
+    assert created_project["documentCount"] == 0
+    assert created_project["indexCount"] == 0
+    assert created_project["status"] == "READY"
+    project_id = created_project["id"]
     response = client.post(
         f"/api/v1/projects/{project_id}/documents",
         files={"file": ("raft.md", b"# Raft\nA follower catches up from the leader log.")},
@@ -32,7 +40,113 @@ def test_project_ingest_index_and_retrieve(tmp_path) -> None:
         },
     )
     assert retrieved.status_code == 200, retrieved.text
-    assert retrieved.json()["context"]
+    payload = retrieved.json()
+    assert payload["finalContext"]
+    assert [lane["method"] for lane in payload["lanes"]] == ["VECTOR", "BM25", "HYBRID"]
+    assert payload["stageLatency"]["totalMs"] >= 0
+    assert set(payload["stageLatency"]) == {
+        "vectorMs",
+        "bm25Ms",
+        "fusionMs",
+        "rerankMs",
+        "assembleMs",
+        "totalMs",
+    }
+    relevant_id = payload["lanes"][-1]["hits"][0]["chunk"]["id"]
+    evaluation = client.post(
+        f"/api/v1/projects/{project_id}/evaluation-queries",
+        json={
+            "query": "How does a follower catch up?",
+            "relevantChunkIds": [relevant_id],
+            "datasetVersion": 1,
+            "notes": "Known fixture answer",
+        },
+    )
+    assert evaluation.status_code == 201, evaluation.text
+    experiment = client.post(
+        f"/api/v1/projects/{project_id}/experiments",
+        json={
+            "name": "hybrid-fixture",
+            "datasetVersion": 1,
+            "indexConfigurationId": index_id,
+            "method": "HYBRID",
+            "kValues": [1, 3, 5],
+        },
+    )
+    assert experiment.status_code == 201, experiment.text
+    detail = client.get(f"/api/v1/experiments/{experiment.json()['id']}")
+    assert detail.json()["metrics"]["recall@1"] == 1.0
+    exported = client.get(
+        f"/api/v1/projects/{project_id}/evaluation-queries/export?dataset_version=1"
+    )
+    assert exported.json()["schema"] == "contextbench.evaluation.v1"
+    assert exported.json()["queries"][0]["notes"] == "Known fixture answer"
+    imported = client.post(
+        f"/api/v1/projects/{project_id}/evaluation-queries/import",
+        json=exported.json(),
+    )
+    assert imported.status_code == 201, imported.text
+    assert imported.json()["imported"] == 1
+    with create_session_factory(db_path)() as session:
+        assert session.scalar(select(func.count()).select_from(RetrievalRun)) == 1
+
+
+def test_multiple_index_configurations_keep_their_own_chunks(tmp_path) -> None:
+    client = TestClient(create_app(tmp_path / "db.sqlite", tmp_path / "vectors"))
+    project_id = client.post("/api/v1/projects", json={"name": "Frozen indexes"}).json()["id"]
+    client.post(
+        f"/api/v1/projects/{project_id}/documents",
+        data={"tags": "consensus, fixture"},
+        files={
+            "file": (
+                "notes.md",
+                b"# Election\nA candidate requests votes from peers.\n\n"
+                b"# Repair\nA follower catches up from the leader log.",
+            )
+        },
+    )
+
+    first = client.post(
+        f"/api/v1/projects/{project_id}/indexes",
+        json={
+            "name": "fixed",
+            "chunking": {"strategy": "FIXED_TOKEN", "chunkSize": 5, "overlap": 1},
+            "embedding": {"provider": "hash"},
+        },
+    ).json()
+    second = client.post(
+        f"/api/v1/projects/{project_id}/indexes",
+        json={
+            "name": "heading",
+            "chunking": {"strategy": "HEADING"},
+            "embedding": {"provider": "hash"},
+        },
+    ).json()
+
+    assert first["id"] != second["id"]
+    assert first["chunkCount"] != second["chunkCount"]
+    for index_id in (first["id"], second["id"]):
+        response = client.post(
+            f"/api/v1/projects/{project_id}/retrieve",
+            json={
+                "query": "follower leader log",
+                "indexConfigurationId": index_id,
+                "methods": ["BM25", "HYBRID"],
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["lanes"][0]["hits"]
+    filtered = client.post(
+        f"/api/v1/projects/{project_id}/retrieve",
+        json={
+            "query": "follower leader log",
+            "indexConfigurationId": second["id"],
+            "methods": ["BM25"],
+            "filters": {"tags": ["missing"]},
+        },
+    )
+    assert filtered.status_code == 200
+    assert filtered.json()["lanes"][0]["hits"] == []
 
 
 def test_consistent_validation_error_shape(tmp_path) -> None:
@@ -41,3 +155,28 @@ def test_consistent_validation_error_shape(tmp_path) -> None:
     assert response.status_code == 422
     assert set(response.json()) == {"error"}
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_project_conflict_and_pagination_validation(tmp_path) -> None:
+    client = TestClient(create_app(tmp_path / "db.sqlite", tmp_path / "vectors"))
+    assert client.post("/api/v1/projects", json={"name": "Unique"}).status_code == 201
+    conflict = client.post("/api/v1/projects", json={"name": "Unique"})
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "CONFLICT"
+    assert client.get("/api/v1/projects?page_size=0").status_code == 422
+    projects = client.get("/api/v1/projects").json()
+    assert projects["data"][0]["documentCount"] == 0
+
+
+def test_generation_uses_deterministic_no_answer_before_ollama(tmp_path) -> None:
+    client = TestClient(create_app(tmp_path / "db.sqlite", tmp_path / "vectors"))
+    response = client.post(
+        "/api/v1/generate",
+        json={"question": "What is Raft?", "context": "too short", "minimumEvidenceTokens": 5},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "answer": "Retrieved evidence appears insufficient to answer this question.",
+        "generated": False,
+        "reason": "INSUFFICIENT_EVIDENCE",
+    }

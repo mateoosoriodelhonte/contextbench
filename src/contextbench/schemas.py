@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def to_camel(value: str) -> str:
@@ -61,8 +61,14 @@ class ChunkingConfig(CBModel):
 class EmbeddingConfig(CBModel):
     provider: EmbeddingProvider = EmbeddingProvider.HASH
     model: str = "contextbench-hash-v1"
+    revision: str | None = Field(default=None, max_length=200)
     dimension: int = Field(default=64, ge=1, le=8192)
     normalize: bool = True
+    allow_model_download: bool = False
+
+
+class RerankerConfig(CBModel):
+    model: str = "cross-encoder/ms-marco-MiniLM-L6-v2"
     allow_model_download: bool = False
 
 
@@ -106,12 +112,37 @@ class RetrieveRequest(CBModel):
     methods: list[RetrievalMethod] = Field(default_factory=lambda: [RetrievalMethod.HYBRID])
     filters: RetrievalFilters = Field(default_factory=RetrievalFilters)
     max_context_tokens: int = Field(default=1200, ge=1, le=100000)
+    reranker: RerankerConfig | None = None
+
+    @model_validator(mode="after")
+    def retrieval_bounds(self) -> RetrieveRequest:
+        if self.candidate_k < self.top_k:
+            raise ValueError("candidateK must be greater than or equal to topK")
+        if not self.methods:
+            raise ValueError("methods must contain at least one retrieval method")
+        self.methods = list(dict.fromkeys(self.methods))
+        return self
 
 
 class EvaluationQueryRequest(CBModel):
     query: str = Field(min_length=1, max_length=10000)
     relevant_chunk_ids: list[UUID] = Field(default_factory=list)
     dataset_version: int = Field(default=1, ge=1)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class EvaluationDatasetImport(CBModel):
+    schema_name: Literal["contextbench.evaluation.v1"] = Field(alias="schema")
+    dataset_version: int = Field(default=1, ge=1)
+    queries: list[EvaluationQueryRequest] = Field(min_length=1, max_length=10000)
+
+
+class GenerateRequest(CBModel):
+    question: str = Field(min_length=1, max_length=10000)
+    context: str = Field(max_length=500000)
+    model: str = Field(default="llama3.2", min_length=1, max_length=200)
+    base_url: str = Field(default="http://127.0.0.1:11434", max_length=2048)
+    minimum_evidence_tokens: int = Field(default=20, ge=1, le=10000)
 
 
 class ExperimentRequest(CBModel):
@@ -119,7 +150,7 @@ class ExperimentRequest(CBModel):
     dataset_version: int = Field(default=1, ge=1)
     index_configuration_id: UUID
     method: RetrievalMethod = RetrievalMethod.HYBRID
-    reranker: str | None = None
+    reranker: RerankerConfig | None = None
     k_values: list[int] = Field(default_factory=lambda: [1, 3, 5, 10])
 
     @field_validator("k_values")

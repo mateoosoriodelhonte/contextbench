@@ -2,19 +2,30 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Generator
 from pathlib import Path
+from typing import cast
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .models import Base, Document, Project
 
 
-def create_session_factory(path: str | Path = "contextbench.sqlite3") -> sessionmaker[Session]:
+def create_session_factory(
+    path: str | Path = ".contextbench/contextbench.sqlite3",
+) -> sessionmaker[Session]:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
+
+    @event.listens_for(engine, "connect")
+    def enable_sqlite_integrity(dbapi_connection: object, _: object) -> None:
+        cursor = cast(sqlite3.Connection, dbapi_connection).cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     Base.metadata.create_all(engine)
     return sessionmaker(engine, expire_on_commit=False)
 

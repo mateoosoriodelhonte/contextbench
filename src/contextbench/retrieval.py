@@ -24,6 +24,9 @@ class RetrievedChunk:
     rrf_score: float | None = None
     cross_encoder_score: float | None = None
     reranked_rank: int | None = None
+    document_name: str = "unknown"
+    ordinal: int = 0
+    page: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,15 +40,19 @@ def build_context(chunks: list[RetrievedChunk], max_tokens: int) -> str:
     """Keep ranking order and whole chunks; trim only at deterministic token boundaries."""
     selected: list[str] = []
     used = 0
-    for chunk in chunks:
-        words = chunk.text.split()
-        if used + len(words) > max_tokens:
-            remaining = max_tokens - used
-            if remaining > 0:
-                selected.append(" ".join(words[:remaining]))
+    for citation, chunk in enumerate(chunks, 1):
+        location = f" · page {chunk.page}" if chunk.page else ""
+        header = f"[{citation}] {chunk.document_name} · chunk {chunk.ordinal}{location}"
+        header_tokens = len(header.split())
+        text_words = chunk.text.split()
+        remaining = max_tokens - used
+        if remaining <= header_tokens:
             break
-        selected.append(chunk.text)
-        used += len(words)
+        if header_tokens + len(text_words) > remaining:
+            selected.append(f"{header}\n{' '.join(text_words[: remaining - header_tokens])}")
+            break
+        selected.append(f"{header}\n{chunk.text}")
+        used += header_tokens + len(text_words)
     return "\n\n".join(selected)
 
 
@@ -101,6 +108,7 @@ class RetrievalEngine:
         filters: RetrievalFilters | None = None,
         max_context_tokens: int = 1200,
     ) -> RetrievalResult:
+        total_started = time.perf_counter()
         filters = filters or RetrievalFilters()
         allowed = [(doc, chunk) for doc, chunk in chunks if self._allowed(doc, filters)]
         by_id = {chunk.id: (doc, chunk) for doc, chunk in allowed}
@@ -108,11 +116,20 @@ class RetrievalEngine:
         latencies: dict[str, float] = {}
         vector_rank_ids: list[str] = []
         bm25_rank_ids: list[str] = []
-        if (
+        needs_vector = (
             RetrievalMethod.VECTOR in methods
             or RetrievalMethod.HYBRID in methods
             or RetrievalMethod.RERANKED in methods
-        ):
+        )
+        needs_bm25 = (
+            RetrievalMethod.BM25 in methods
+            or RetrievalMethod.HYBRID in methods
+            or RetrievalMethod.RERANKED in methods
+        )
+        vector_items: list[RetrievedChunk] = []
+        bm25_items: list[RetrievedChunk] = []
+        hybrid_candidates: list[RetrievedChunk] = []
+        if needs_vector:
             started = time.perf_counter()
             vector = self.embedder.embed([query])[0]
             results = (
@@ -123,36 +140,41 @@ class RetrievalEngine:
                 else []
             )
             vector_rank_ids = [identifier for identifier, _, _ in results if identifier in by_id]
-            rankings[RetrievalMethod.VECTOR.value] = [
+            vector_items = [
                 self._item(identifier, score, by_id, RetrievalMethod.VECTOR, i)
                 for i, (identifier, score, _) in enumerate(results, 1)
                 if identifier in by_id
-            ][:top_k]
+            ]
+            if RetrievalMethod.VECTOR in methods:
+                rankings[RetrievalMethod.VECTOR.value] = vector_items[:top_k]
             latencies["vector"] = (time.perf_counter() - started) * 1000
-        if RetrievalMethod.BM25 in methods or RetrievalMethod.HYBRID in methods:
+        if needs_bm25:
             started = time.perf_counter()
             bm25 = BM25((chunk.id, chunk.text) for _, chunk in allowed)
             pairs = bm25.search(query, candidate_k)
             bm25_rank_ids = [identifier for identifier, _ in pairs]
-            rankings[RetrievalMethod.BM25.value] = [
+            bm25_items = [
                 self._item(identifier, score, by_id, RetrievalMethod.BM25, i)
                 for i, (identifier, score) in enumerate(pairs, 1)
-            ][:top_k]
+            ]
+            if RetrievalMethod.BM25 in methods:
+                rankings[RetrievalMethod.BM25.value] = bm25_items[:top_k]
             latencies["bm25"] = (time.perf_counter() - started) * 1000
         if RetrievalMethod.HYBRID in methods or RetrievalMethod.RERANKED in methods:
             started = time.perf_counter()
             fused = reciprocal_rank_fusion(
                 {"vector": vector_rank_ids, "bm25": bm25_rank_ids}, limit=candidate_k
             )
-            items = [
+            hybrid_candidates = [
                 self._item(identifier, score, by_id, RetrievalMethod.HYBRID, i, rrf_score=score)
                 for i, (identifier, score) in enumerate(fused, 1)
             ]
-            rankings[RetrievalMethod.HYBRID.value] = items[:top_k]
+            if RetrievalMethod.HYBRID in methods:
+                rankings[RetrievalMethod.HYBRID.value] = hybrid_candidates[:top_k]
             latencies["hybrid"] = (time.perf_counter() - started) * 1000
         if RetrievalMethod.RERANKED in methods:
             started = time.perf_counter()
-            candidates = rankings.get(RetrievalMethod.HYBRID.value, [])[:candidate_k]
+            candidates = hybrid_candidates[:candidate_k]
             if self.reranker is not None and candidates:
                 scores = self.reranker.predict([(query, item.text) for item in candidates])
                 reranked = sorted(
@@ -170,20 +192,41 @@ class RetrievalEngine:
                         item.rrf_score,
                         float(score),
                         i,
+                        item.document_name,
+                        item.ordinal,
+                        item.page,
                     )
                     for i, (item, score) in enumerate(reranked[:top_k], 1)
                 ]
             else:
-                rankings[RetrievalMethod.RERANKED.value] = candidates[:top_k]
+                rankings[RetrievalMethod.RERANKED.value] = [
+                    RetrievedChunk(
+                        item.chunk_id,
+                        item.document_id,
+                        item.text,
+                        item.native_score,
+                        item.rank,
+                        RetrievalMethod.RERANKED,
+                        item.rrf_score,
+                        None,
+                        reranked_rank,
+                        item.document_name,
+                        item.ordinal,
+                        item.page,
+                    )
+                    for reranked_rank, item in enumerate(candidates[:top_k], 1)
+                ]
             latencies["reranked"] = (time.perf_counter() - started) * 1000
         context_method = (
             RetrievalMethod.RERANKED.value
             if RetrievalMethod.RERANKED.value in rankings
             else next(iter(rankings), RetrievalMethod.BM25.value)
         )
-        return RetrievalResult(
-            rankings, latencies, build_context(rankings.get(context_method, []), max_context_tokens)
-        )
+        context_started = time.perf_counter()
+        context = build_context(rankings.get(context_method, []), max_context_tokens)
+        latencies["context"] = (time.perf_counter() - context_started) * 1000
+        latencies["total"] = (time.perf_counter() - total_started) * 1000
+        return RetrievalResult(rankings, latencies, context)
 
     @staticmethod
     def _item(
@@ -196,4 +239,15 @@ class RetrievalEngine:
         rrf_score: float | None = None,
     ) -> RetrievedChunk:
         doc, chunk = by_id[identifier]
-        return RetrievedChunk(identifier, doc.id, chunk.text, float(score), rank, method, rrf_score)
+        return RetrievedChunk(
+            identifier,
+            doc.id,
+            chunk.text,
+            float(score),
+            rank,
+            method,
+            rrf_score,
+            document_name=doc.filename,
+            ordinal=chunk.ordinal,
+            page=chunk.metadata_json.get("page"),
+        )

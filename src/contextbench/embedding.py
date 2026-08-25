@@ -44,15 +44,21 @@ class ModelDownloadRequired(RuntimeError):
     code = "MODEL_DOWNLOAD_REQUIRED"
 
 
+class ModelRuntimeUnavailable(RuntimeError):
+    code = "MODEL_RUNTIME_UNAVAILABLE"
+
+
 class SentenceTransformersEmbeddingProvider:
     def __init__(
         self,
         model: str = "BAAI/bge-small-en-v1.5",
         *,
+        revision: str | None = None,
         normalize: bool = True,
         allow_model_download: bool = False,
     ) -> None:
         self.model_name = model
+        self.revision = revision
         self.normalize = normalize
         self.allow_model_download = allow_model_download
         self._model: object | None = None
@@ -64,10 +70,12 @@ class SentenceTransformersEmbeddingProvider:
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
         except ImportError as exc:
-            raise RuntimeError(
+            raise ModelRuntimeUnavailable(
                 "sentence-transformers is not installed; install the ml extra"
             ) from exc
         kwargs: dict[str, object] = {}
+        if self.revision:
+            kwargs["revision"] = self.revision
         if not self.allow_model_download:
             kwargs["local_files_only"] = True
         try:
@@ -84,3 +92,42 @@ class SentenceTransformersEmbeddingProvider:
         model: Any = self._load()
         result = model.encode(list(texts), normalize_embeddings=self.normalize)
         return [list(map(float, row)) for row in result]
+
+
+class CrossEncoderReranker:
+    """Lazy local cross-encoder. Model downloads require explicit consent."""
+
+    def __init__(
+        self,
+        model: str = "cross-encoder/ms-marco-MiniLM-L6-v2",
+        *,
+        allow_model_download: bool = False,
+    ) -> None:
+        self.model_name = model
+        self.allow_model_download = allow_model_download
+        self._model: object | None = None
+
+    def _load(self) -> object:
+        if self._model is not None:
+            return self._model
+        try:
+            from sentence_transformers import CrossEncoder
+        except ImportError as exc:
+            raise ModelRuntimeUnavailable(
+                "sentence-transformers is not installed; install the ml extra"
+            ) from exc
+        try:
+            self._model = CrossEncoder(
+                self.model_name,
+                local_files_only=not self.allow_model_download,
+            )
+        except Exception as exc:
+            if not self.allow_model_download:
+                raise ModelDownloadRequired(self.model_name) from exc
+            raise
+        return self._model
+
+    def predict(self, pairs: Sequence[tuple[str, str]]) -> list[float]:
+        model: Any = self._load()
+        scores = model.predict(list(pairs))
+        return [float(score) for score in scores]

@@ -27,6 +27,9 @@ class LocalVectorStore:
             vectors_config=models.VectorParams(size=dimension, distance=models.Distance.COSINE),
         )
 
+    def close(self) -> None:
+        self.client.close()
+
     def upsert(
         self,
         index_id: str,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from .schemas import ChunkingConfig, ChunkStrategy
@@ -21,6 +22,7 @@ class Chunk:
 
 def normalize_text(text: str) -> str:
     """Normalize line endings, remove control characters, and collapse excess whitespace."""
+    text = unicodedata.normalize("NFKC", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
@@ -71,19 +73,17 @@ def chunk_text(text: str, config: ChunkingConfig) -> list[Chunk]:
             Chunk(p, i, s, e, len(p.split()), sections[i][0], {"heading": sections[i][0]})
             for i, (p, (s, e)) in enumerate(zip(pieces, offsets, strict=True))
         ]
-    words = text.split()
+    word_matches = list(re.finditer(r"\S+", text))
     size = config.chunk_size
     step = size - config.overlap
     chunks: list[Chunk] = []
-    for ordinal, start_word in enumerate(range(0, len(words), step)):
-        piece_words = words[start_word : start_word + size]
-        if not piece_words:
+    for ordinal, start_word in enumerate(range(0, len(word_matches), step)):
+        piece_matches = word_matches[start_word : start_word + size]
+        if not piece_matches:
             break
-        piece = " ".join(piece_words)
-        start = text.find(piece, 0 if not chunks else chunks[-1].start_char)
-        if start < 0:
-            start = 0 if not chunks else chunks[-1].end_char
-        chunks.append(Chunk(piece, ordinal, start, start + len(piece), len(piece_words)))
-        if start_word + size >= len(words):
+        start = piece_matches[0].start()
+        end = piece_matches[-1].end()
+        chunks.append(Chunk(text[start:end], ordinal, start, end, len(piece_matches)))
+        if start_word + size >= len(word_matches):
             break
     return chunks

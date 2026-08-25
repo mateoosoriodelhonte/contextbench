@@ -6,6 +6,7 @@ import hashlib
 import io
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from pypdf import PdfReader
 
@@ -36,7 +37,7 @@ class IngestedDocument:
     source_type: SourceType
     text: str
     sha256: str
-    metadata: dict[str, str]
+    metadata: dict[str, Any]
 
 
 class IngestionError(ValueError):
@@ -51,6 +52,7 @@ def ingest_bytes(
     if len(data) > max_bytes:
         raise IngestionError("document exceeds the maximum size")
     suffix = Path(filename).suffix.lower()
+    page_offsets: list[dict[str, int]] = []
     if suffix in ALLOWED_SUFFIXES:
         source_type = ALLOWED_SUFFIXES[suffix]
         text = data.decode("utf-8-sig", errors="strict")
@@ -58,9 +60,21 @@ def ingest_bytes(
         source_type = SourceType.PDF
         try:
             reader = PdfReader(io.BytesIO(data), strict=False)
-            text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+            extracted_pages = [normalize_text(page.extract_text() or "") for page in reader.pages]
         except Exception as exc:
             raise IngestionError("invalid PDF document") from exc
+        pieces: list[str] = []
+        cursor = 0
+        for page_number, page_text in enumerate(extracted_pages, 1):
+            if not page_text:
+                continue
+            if pieces:
+                cursor += 2
+            start = cursor
+            pieces.append(page_text)
+            cursor += len(page_text)
+            page_offsets.append({"page": page_number, "startChar": start, "endChar": cursor})
+        text = "\n\n".join(pieces)
     elif suffix in SOURCE_SUFFIXES:
         source_type = SourceType.SOURCE
         text = data.decode("utf-8-sig", errors="strict")
@@ -69,7 +83,8 @@ def ingest_bytes(
     text = normalize_text(text)
     if not text:
         raise IngestionError("document has no extractable text")
-    return IngestedDocument(filename, source_type, text, hashlib.sha256(data).hexdigest(), {})
+    metadata = {"pages": page_offsets} if source_type is SourceType.PDF else {}
+    return IngestedDocument(filename, source_type, text, hashlib.sha256(data).hexdigest(), metadata)
 
 
 def ingest_path(path: str | Path, *, allowed_root: str | Path | None = None) -> IngestedDocument:

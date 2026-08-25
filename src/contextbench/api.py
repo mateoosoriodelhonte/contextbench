@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
-from fastapi import FastAPI, File, UploadFile
+import httpx
+from fastapi import FastAPI, File, Form, Query, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
@@ -15,12 +17,14 @@ from sqlalchemy import select
 from .chunking import chunk_text
 from .db import create_session_factory
 from .embedding import (
+    CrossEncoderReranker,
     HashEmbeddingProvider,
     ModelDownloadRequired,
+    ModelRuntimeUnavailable,
     SentenceTransformersEmbeddingProvider,
 )
 from .experiments import compare_experiments, evaluate_rankings, export_experiment
-from .ingestion import IngestionError, ingest_bytes
+from .ingestion import MAX_DOCUMENT_BYTES, IngestionError, ingest_bytes
 from .models import (
     ChunkRecord,
     Document,
@@ -30,17 +34,24 @@ from .models import (
     IndexConfiguration,
     Project,
     RelevantChunk,
+    RetrievalRun,
+    utc_now,
 )
+from .ollama import OllamaClient
 from .retrieval import RetrievalEngine
 from .schemas import (
     CreateProjectRequest,
     ErrorBody,
     ErrorResponse,
+    EvaluationDatasetImport,
     EvaluationQueryRequest,
     ExperimentRequest,
+    GenerateRequest,
     IndexConfigurationRequest,
     Page,
     Pagination,
+    RerankerConfig,
+    RetrievalMethod,
     RetrieveRequest,
 )
 from .vector_store import LocalVectorStore
@@ -74,6 +85,17 @@ def _page(data: list[Any], page: int, page_size: int, total: int) -> dict[str, A
     ).model_dump(by_alias=True)
 
 
+def _chunk_metadata(
+    document: Document, start_char: int, base: dict[str, object]
+) -> dict[str, object]:
+    metadata = dict(base)
+    for page in document.metadata_json.get("pages", []):
+        if int(page["startChar"]) <= start_char < int(page["endChar"]):
+            metadata["page"] = int(page["page"])
+            break
+    return metadata
+
+
 class AppState:
     def __init__(self, db_path: str | Path, vector_path: str | Path) -> None:
         self.factory = create_session_factory(db_path)
@@ -84,6 +106,7 @@ class AppState:
         if data.get("provider") == "sentence-transformers":
             return SentenceTransformersEmbeddingProvider(
                 data.get("model", "BAAI/bge-small-en-v1.5"),
+                revision=data.get("revision"),
                 normalize=bool(data.get("normalize", True)),
                 allow_model_download=bool(
                     data.get("allowModelDownload", data.get("allow_model_download", False))
@@ -93,9 +116,19 @@ class AppState:
             int(data.get("dimension", config.vector_dimension)), bool(data.get("normalize", True))
         )
 
+    @staticmethod
+    def reranker(config: RerankerConfig | None) -> CrossEncoderReranker | None:
+        if config is None:
+            return None
+        return CrossEncoderReranker(
+            config.model,
+            allow_model_download=config.allow_model_download,
+        )
+
 
 def create_app(
-    db_path: str | Path = "contextbench.sqlite3", vector_path: str | Path = "contextbench-qdrant"
+    db_path: str | Path = ".contextbench/contextbench.sqlite3",
+    vector_path: str | Path = ".contextbench/qdrant",
 ) -> FastAPI:
     state = AppState(db_path, vector_path)
     app = FastAPI(title="ContextBench", version="1.0.0")
@@ -116,23 +149,32 @@ def create_app(
         return {"status": "ok", "storage": "sqlite", "vectorStore": "qdrant-local"}
 
     @app.get("/api/v1/projects")
-    def list_projects(page: int = 1, page_size: int = 50) -> dict[str, Any]:
+    def list_projects(
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=200)] = 50,
+    ) -> dict[str, Any]:
         with state.factory() as session:
             rows = list(session.scalars(select(Project).order_by(Project.created_at.desc())))
-        data = [
-            {
-                "id": row.id,
-                "name": row.name,
-                "description": row.description,
-                "createdAt": row.created_at,
-            }
-            for row in rows
-        ]
+            data = [
+                {
+                    "id": row.id,
+                    "name": row.name,
+                    "description": row.description,
+                    "documentCount": len(row.documents),
+                    "indexCount": len(row.indexes),
+                    "status": "READY",
+                    "updatedAt": row.created_at,
+                    "createdAt": row.created_at,
+                }
+                for row in rows
+            ]
         return _page(data[(page - 1) * page_size : page * page_size], page, page_size, len(data))
 
     @app.post("/api/v1/projects", status_code=201)
     def create_project(request: CreateProjectRequest) -> dict[str, Any]:
         with state.factory.begin() as session:
+            if session.scalar(select(Project.id).where(Project.name == request.name)):
+                raise APIError("CONFLICT", "A project with this name already exists.", 409)
             project = Project(name=request.name, description=request.description)
             session.add(project)
             session.flush()
@@ -140,6 +182,10 @@ def create_app(
                 "id": project.id,
                 "name": project.name,
                 "description": project.description,
+                "documentCount": 0,
+                "indexCount": 0,
+                "status": "READY",
+                "updatedAt": project.created_at,
                 "createdAt": project.created_at,
             }
 
@@ -148,6 +194,18 @@ def create_app(
         if project is None:
             raise APIError("NOT_FOUND", "Project not found.", 404)
         return cast(Project, project)
+
+    def chunks_for_index(
+        session: Any, index_configuration_id: str
+    ) -> list[tuple[Document, ChunkRecord]]:
+        chunks = list(
+            session.scalars(
+                select(ChunkRecord)
+                .where(ChunkRecord.index_configuration_id == index_configuration_id)
+                .order_by(ChunkRecord.document_id, ChunkRecord.ordinal)
+            )
+        )
+        return [(chunk.document, chunk) for chunk in chunks]
 
     @app.get("/api/v1/projects/{project_id}")
     def get_project(project_id: str) -> dict[str, Any]:
@@ -160,10 +218,16 @@ def create_app(
                 "createdAt": project.created_at,
                 "documentCount": len(project.documents),
                 "indexCount": len(project.indexes),
+                "status": "READY",
+                "updatedAt": project.created_at,
             }
 
     @app.get("/api/v1/projects/{project_id}/documents")
-    def list_documents(project_id: str, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+    def list_documents(
+        project_id: str,
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=200)] = 50,
+    ) -> dict[str, Any]:
         with state.factory() as session:
             project_or_error(session, project_id)
             rows = list(
@@ -178,6 +242,10 @@ def create_app(
                     "id": row.id,
                     "filename": row.filename,
                     "sourceType": row.source_type,
+                    "tags": row.tags,
+                    "chunkCount": len(row.chunks),
+                    "status": "READY",
+                    "updatedAt": row.created_at,
                     "sha256": row.sha256,
                     "createdAt": row.created_at,
                 }
@@ -186,8 +254,12 @@ def create_app(
         return _page(data[(page - 1) * page_size : page * page_size], page, page_size, len(data))
 
     @app.post("/api/v1/projects/{project_id}/documents", status_code=201)
-    async def ingest_document(project_id: str, file: UploadFile = File(...)) -> dict[str, Any]:  # noqa: B008
-        data = await file.read()
+    async def ingest_document(
+        project_id: str,
+        file: UploadFile = File(...),  # noqa: B008
+        tags: str = Form(""),  # noqa: B008
+    ) -> dict[str, Any]:
+        data = await file.read(MAX_DOCUMENT_BYTES + 1)
         try:
             ingested = ingest_bytes(file.filename or "document.txt", data)
         except (IngestionError, UnicodeError) as exc:
@@ -214,7 +286,8 @@ def create_app(
                 source_type=ingested.source_type.value,
                 content=ingested.text,
                 sha256=ingested.sha256,
-                tags=[],
+                tags=[tag.strip() for tag in tags.split(",") if tag.strip()][:20],
+                metadata_json=ingested.metadata,
             )
             session.add(document)
             session.flush()
@@ -228,19 +301,32 @@ def create_app(
             }
 
     @app.get("/api/v1/documents/{document_id}/chunks")
-    def list_chunks(document_id: str, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+    def list_chunks(
+        document_id: str,
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=200)] = 50,
+        index_configuration_id: str | None = None,
+    ) -> dict[str, Any]:
         with state.factory() as session:
+            document = session.get(Document, document_id)
+            if document is None:
+                raise APIError("NOT_FOUND", "Document not found.", 404)
+            statement = select(ChunkRecord).where(ChunkRecord.document_id == document_id)
+            if index_configuration_id:
+                statement = statement.where(
+                    ChunkRecord.index_configuration_id == index_configuration_id
+                )
             rows = list(
                 session.scalars(
-                    select(ChunkRecord)
-                    .where(ChunkRecord.document_id == document_id)
-                    .order_by(ChunkRecord.ordinal)
+                    statement.order_by(ChunkRecord.index_configuration_id, ChunkRecord.ordinal)
                 )
             )
         data = [
             {
                 "id": row.id,
                 "documentId": row.document_id,
+                "documentName": document.filename,
+                "indexConfigurationId": row.index_configuration_id,
                 "ordinal": row.ordinal,
                 "text": row.text,
                 "tokenCount": row.token_count,
@@ -248,6 +334,7 @@ def create_app(
                 "endChar": row.end_char,
                 "heading": row.heading,
                 "metadata": row.metadata_json,
+                "page": row.metadata_json.get("page"),
             }
             for row in rows
         ]
@@ -268,6 +355,10 @@ def create_app(
     def create_index(project_id: str, request: IndexConfigurationRequest) -> dict[str, Any]:
         with state.factory.begin() as session:
             project = project_or_error(session, project_id)
+            if not project.documents:
+                raise APIError(
+                    "VALIDATION_ERROR", "Add at least one document before building an index.", 422
+                )
             embedding = request.embedding.model_dump(mode="json", by_alias=True)
             config = IndexConfiguration(
                 project_id=project.id,
@@ -280,49 +371,71 @@ def create_app(
             session.add(config)
             session.flush()
             for document in project.documents:
-                document.chunks.clear()
-                document.chunks.extend(
+                config.chunks.extend(
                     ChunkRecord(
+                        document=document,
                         ordinal=part.ordinal,
                         text=part.text,
                         token_count=part.token_count,
                         start_char=part.start_char,
                         end_char=part.end_char,
                         heading=part.heading,
-                        metadata_json=part.metadata or {},
+                        metadata_json=_chunk_metadata(
+                            document, part.start_char, part.metadata or {}
+                        ),
                     )
                     for part in chunk_text(document.content, request.chunking)
                 )
             session.flush()
-            chunks = [(doc, chunk) for doc in project.documents for chunk in doc.chunks]
+            chunks = chunks_for_index(session, config.id)
             try:
+                indexing_started = time.perf_counter()
                 embedder = state.embedder(config)
                 if embedder.dimension == 0:
                     embedder.embed([""])
                     config.vector_dimension = embedder.dimension
                 engine = RetrievalEngine(state.store, embedder)
                 count = engine.index(config.id, chunks)
+                config.vector_count = count
+                config.indexing_ms = (time.perf_counter() - indexing_started) * 1000
+                config.embedding_json = config.embedding_json | {
+                    "dimension": embedder.dimension,
+                    "allowModelDownload": False,
+                }
                 config.status = "READY"
             except ModelDownloadRequired as exc:
                 config.status = "FAILED"
                 raise APIError(
                     "MODEL_DOWNLOAD_REQUIRED",
-                    "The embedding model is not cached.",
+                    "The requested local model is not cached.",
                     409,
                     {"model": str(exc)},
                 ) from exc
+            except ModelRuntimeUnavailable as exc:
+                config.status = "FAILED"
+                raise APIError("MODEL_RUNTIME_UNAVAILABLE", str(exc), 409) from exc
             return _index_response(config) | {"chunkCount": count}
 
     @app.post("/api/v1/projects/{project_id}/retrieve")
     def retrieve(project_id: str, request: RetrieveRequest) -> dict[str, Any]:
-        with state.factory() as session:
+        if RetrievalMethod.RERANKED in request.methods and request.reranker is None:
+            raise APIError(
+                "RERANKER_REQUIRED",
+                "A reranker configuration is required for RERANKED retrieval.",
+                422,
+            )
+        with state.factory.begin() as session:
             project = project_or_error(session, project_id)
             config = session.get(IndexConfiguration, str(request.index_configuration_id))
             if config is None or config.project_id != project_id:
                 raise APIError("NOT_FOUND", "Index configuration not found.", 404)
-            chunks = [(doc, chunk) for doc in project.documents for chunk in doc.chunks]
+            chunks = chunks_for_index(session, config.id)
             try:
-                result = RetrievalEngine(state.store, state.embedder(config)).retrieve(
+                result = RetrievalEngine(
+                    state.store,
+                    state.embedder(config),
+                    reranker=state.reranker(request.reranker),
+                ).retrieve(
                     config.id,
                     request.query,
                     chunks,
@@ -339,27 +452,76 @@ def create_app(
                     409,
                     {"model": str(exc)},
                 ) from exc
-            rankings = {
-                method: [
-                    {
-                        "chunkId": item.chunk_id,
-                        "documentId": item.document_id,
-                        "text": item.text,
-                        "nativeScore": item.native_score,
-                        "rank": item.rank,
-                        "rrfScore": item.rrf_score,
-                        "crossEncoderScore": item.cross_encoder_score,
-                        "rerankedRank": item.reranked_rank,
-                    }
-                    for item in items
-                ]
+            except ModelRuntimeUnavailable as exc:
+                raise APIError("MODEL_RUNTIME_UNAVAILABLE", str(exc), 409) from exc
+            document_names = {document.id: document.filename for document in project.documents}
+            by_chunk = {chunk.id: chunk for _, chunk in chunks}
+            lanes = [
+                {
+                    "method": method,
+                    "label": {
+                        "VECTOR": "Vector search",
+                        "BM25": "BM25 lexical",
+                        "HYBRID": "Hybrid RRF",
+                        "RERANKED": "Hybrid + reranker",
+                    }[method],
+                    "latencyMs": result.latencies_ms.get(method.lower(), 0.0),
+                    "hits": [
+                        {
+                            "chunk": {
+                                "id": item.chunk_id,
+                                "documentId": item.document_id,
+                                "documentName": document_names.get(
+                                    item.document_id, "Unknown source"
+                                ),
+                                "text": item.text,
+                                "ordinal": by_chunk[item.chunk_id].ordinal,
+                                "tokenCount": by_chunk[item.chunk_id].token_count,
+                                "startChar": by_chunk[item.chunk_id].start_char,
+                                "endChar": by_chunk[item.chunk_id].end_char,
+                                "heading": by_chunk[item.chunk_id].heading,
+                            },
+                            "nativeScore": item.native_score,
+                            "rank": item.rank,
+                            "candidateRank": item.rank,
+                            "rrfScore": item.rrf_score,
+                            "crossEncoderScore": item.cross_encoder_score,
+                            "rerankedRank": item.reranked_rank,
+                        }
+                        for item in items
+                    ],
+                }
                 for method, items in result.rankings.items()
+            ]
+            context_items = next(
+                (items for items in reversed(list(result.rankings.values())) if items), []
+            )
+            response_payload = {
+                "query": request.query,
+                "lanes": lanes,
+                "stageLatency": {
+                    "vectorMs": result.latencies_ms.get("vector", 0.0),
+                    "bm25Ms": result.latencies_ms.get("bm25", 0.0),
+                    "fusionMs": result.latencies_ms.get("hybrid", 0.0),
+                    "rerankMs": result.latencies_ms.get("reranked", 0.0),
+                    "assembleMs": result.latencies_ms.get("context", 0.0),
+                    "totalMs": result.latencies_ms.get("total", 0.0),
+                },
+                "finalContext": result.context,
+                "contextTokens": len(result.context.split()),
+                "sourceDiversity": len({item.document_id for item in context_items}),
             }
-            return {
-                "rankings": rankings,
-                "latenciesMs": result.latencies_ms,
-                "context": result.context,
-            }
+            session.add(
+                RetrievalRun(
+                    project_id=project_id,
+                    index_configuration_id=config.id,
+                    query=request.query,
+                    method=",".join(method.value for method in request.methods),
+                    request_json=request.model_dump(mode="json", by_alias=True),
+                    response_json=response_payload,
+                )
+            )
+            return response_payload
 
     @app.get("/api/v1/projects/{project_id}/evaluation-queries")
     def list_eval_queries(project_id: str) -> dict[str, Any]:
@@ -376,6 +538,8 @@ def create_app(
                     "query": row.query,
                     "datasetVersion": row.dataset_version,
                     "relevantChunkIds": [item.chunk_id for item in row.relevant_chunks],
+                    "notes": row.notes,
+                    "createdAt": row.created_at,
                 }
                 for row in rows
             ]
@@ -385,8 +549,29 @@ def create_app(
     def create_eval_query(project_id: str, request: EvaluationQueryRequest) -> dict[str, Any]:
         with state.factory.begin() as session:
             project_or_error(session, project_id)
+            chunk_ids = {str(chunk_id) for chunk_id in request.relevant_chunk_ids}
+            valid_chunk_ids = set(
+                session.scalars(
+                    select(ChunkRecord.id)
+                    .join(IndexConfiguration)
+                    .where(
+                        IndexConfiguration.project_id == project_id,
+                        ChunkRecord.id.in_(chunk_ids),
+                    )
+                )
+            )
+            if chunk_ids != valid_chunk_ids:
+                raise APIError(
+                    "VALIDATION_ERROR",
+                    "Every relevant chunk must belong to this project.",
+                    422,
+                    {"unknownChunkIds": sorted(chunk_ids - valid_chunk_ids)},
+                )
             row = EvaluationQuery(
-                project_id=project_id, query=request.query, dataset_version=request.dataset_version
+                project_id=project_id,
+                query=request.query,
+                dataset_version=request.dataset_version,
+                notes=request.notes,
             )
             row.relevant_chunks = [
                 RelevantChunk(chunk_id=str(chunk_id)) for chunk_id in request.relevant_chunk_ids
@@ -398,7 +583,44 @@ def create_app(
                 "query": row.query,
                 "datasetVersion": row.dataset_version,
                 "relevantChunkIds": [str(item) for item in request.relevant_chunk_ids],
+                "notes": row.notes,
             }
+
+    @app.get("/api/v1/projects/{project_id}/evaluation-queries/export")
+    def export_eval_queries(project_id: str, dataset_version: int = 1) -> dict[str, Any]:
+        with state.factory() as session:
+            project_or_error(session, project_id)
+            rows = list(
+                session.scalars(
+                    select(EvaluationQuery).where(
+                        EvaluationQuery.project_id == project_id,
+                        EvaluationQuery.dataset_version == dataset_version,
+                    )
+                )
+            )
+            return {
+                "schema": "contextbench.evaluation.v1",
+                "datasetVersion": dataset_version,
+                "queries": [
+                    {
+                        "query": row.query,
+                        "relevantChunkIds": [item.chunk_id for item in row.relevant_chunks],
+                        "notes": row.notes,
+                    }
+                    for row in rows
+                ],
+            }
+
+    @app.post("/api/v1/projects/{project_id}/evaluation-queries/import", status_code=201)
+    def import_eval_queries(project_id: str, request: EvaluationDatasetImport) -> dict[str, Any]:
+        created = [
+            create_eval_query(
+                project_id,
+                query.model_copy(update={"dataset_version": request.dataset_version}),
+            )
+            for query in request.queries
+        ]
+        return {"schema": "contextbench.evaluation.v1", "imported": len(created)}
 
     @app.get("/api/v1/projects/{project_id}/experiments")
     def list_experiments(project_id: str) -> dict[str, Any]:
@@ -417,20 +639,31 @@ def create_app(
     @app.post("/api/v1/projects/{project_id}/experiments", status_code=201)
     def execute_experiment(project_id: str, request: ExperimentRequest) -> dict[str, Any]:
         with state.factory.begin() as session:
-            project = project_or_error(session, project_id)
+            project_or_error(session, project_id)
             config = session.get(IndexConfiguration, str(request.index_configuration_id))
             if config is None or config.project_id != project_id:
                 raise APIError("NOT_FOUND", "Index configuration not found.", 404)
             experiment = Experiment(
                 project_id=project_id,
                 name=request.name,
-                config_json=request.model_dump(mode="json", by_alias=True),
+                config_json=request.model_dump(mode="json", by_alias=True)
+                | {"indexSnapshot": _index_response(config)},
                 status="RUNNING",
             )
             session.add(experiment)
             session.flush()
-            chunks = [(doc, chunk) for doc in project.documents for chunk in doc.chunks]
-            engine = RetrievalEngine(state.store, state.embedder(config))
+            chunks = chunks_for_index(session, config.id)
+            if request.method is RetrievalMethod.RERANKED and request.reranker is None:
+                raise APIError(
+                    "RERANKER_REQUIRED",
+                    "A reranker configuration is required for a reranked experiment.",
+                    422,
+                )
+            engine = RetrievalEngine(
+                state.store,
+                state.embedder(config),
+                reranker=state.reranker(request.reranker),
+            )
             queries = list(
                 session.scalars(
                     select(EvaluationQuery).where(
@@ -440,20 +673,33 @@ def create_app(
                 )
             )
             for query_row in queries:
-                result = engine.retrieve(
-                    config.id,
-                    query_row.query,
-                    chunks,
-                    methods=[request.method],
-                    top_k=max(request.k_values),
-                    candidate_k=max(request.k_values),
-                )
+                relevant_ids = {item.chunk_id for item in query_row.relevant_chunks}
+                if not relevant_ids:
+                    continue
+                try:
+                    result = engine.retrieve(
+                        config.id,
+                        query_row.query,
+                        chunks,
+                        methods=[request.method],
+                        top_k=max(request.k_values),
+                        candidate_k=max(20, max(request.k_values)),
+                    )
+                except ModelDownloadRequired as exc:
+                    raise APIError(
+                        "MODEL_DOWNLOAD_REQUIRED",
+                        "The reranker model is not cached.",
+                        409,
+                        {"model": str(exc)},
+                    ) from exc
+                except ModelRuntimeUnavailable as exc:
+                    raise APIError("MODEL_RUNTIME_UNAVAILABLE", str(exc), 409) from exc
                 ranked_ids = [
                     item.chunk_id for item in result.rankings.get(request.method.value, [])
                 ]
                 metrics = evaluate_rankings(
                     ranked_ids,
-                    {item.chunk_id for item in query_row.relevant_chunks},
+                    relevant_ids,
                     request.k_values,
                 )
                 experiment.results.append(
@@ -464,6 +710,7 @@ def create_app(
                     )
                 )
             experiment.status = "COMPLETED"
+            experiment.executed_at = utc_now()
             return {
                 "id": experiment.id,
                 "name": experiment.name,
@@ -555,6 +802,28 @@ def create_app(
     def create_demo() -> dict[str, Any]:
         return _create_demo(state)
 
+    @app.post("/api/v1/generate")
+    def generate(request: GenerateRequest) -> dict[str, Any]:
+        if len(request.context.split()) < request.minimum_evidence_tokens:
+            return {
+                "answer": "Retrieved evidence appears insufficient to answer this question.",
+                "generated": False,
+                "reason": "INSUFFICIENT_EVIDENCE",
+            }
+        try:
+            answer = OllamaClient(request.base_url, request.model).answer(
+                request.question, request.context
+            )
+        except (ValueError, httpx.HTTPError) as exc:
+            raise APIError("OLLAMA_UNAVAILABLE", str(exc), 503) from exc
+        return {
+            "answer": answer,
+            "generated": answer != "I do not have enough cited evidence.",
+            "reason": None
+            if answer != "I do not have enough cited evidence."
+            else "CITATIONS_MISSING",
+        }
+
     return app
 
 
@@ -567,7 +836,9 @@ def _index_response(config: IndexConfiguration) -> dict[str, Any]:
         "embedding": config.embedding_json,
         "status": config.status,
         "vectorDimension": config.vector_dimension,
-        "createdAt": config.created_at,
+        "vectorCount": config.vector_count,
+        "indexingMs": config.indexing_ms,
+        "createdAt": config.created_at.isoformat(),
     }
 
 
@@ -575,13 +846,24 @@ def _create_demo(state: AppState) -> dict[str, Any]:
     corpus = [
         (
             "raft.md",
-            "# Raft\nA follower that falls behind catches up from the leader log.\n\n"
-            "# Safety\nRaft preserves a committed entry across elections.",
+            "# Follower catch-up\nA Raft leader tracks nextIndex for every follower. After a "
+            "rejected AppendEntries call, it moves that follower's nextIndex backward and "
+            "retries. If the log prefix is compacted, the leader sends an InstallSnapshot call.\n\n"
+            "# Election safety\nA candidate must receive votes from a majority. Voters compare "
+            "the candidate's last log term and index before granting a vote.",
         ),
         (
-            "retrieval.txt",
-            "BM25 ranks lexical matches. Hybrid retrieval combines independent rankings "
-            "with reciprocal rank fusion.",
+            "storage.md",
+            "# Write-ahead logging\nThe log sequence number for a page change must be durable "
+            "before the dirty database page is written. This ordering lets recovery replay "
+            "committed work after a crash.\n\n# MVCC cleanup\nA long-running transaction delays "
+            "cleanup of older row versions and can increase disk use.",
+        ),
+        (
+            "networking.txt",
+            "TCP flow control protects the receiver by advertising a receive window. "
+            "Congestion control protects the network and uses a separate congestion window. "
+            "A sender is limited by the smaller of the two windows.",
         ),
     ]
     with state.factory.begin() as session:
@@ -608,23 +890,6 @@ def _create_demo(state: AppState) -> dict[str, Any]:
                 )
                 session.add(document)
                 session.flush()
-                for part in chunk_text(
-                    text,
-                    __import__("contextbench.schemas", fromlist=["ChunkingConfig"]).ChunkingConfig(
-                        strategy="PARAGRAPH"
-                    ),
-                ):
-                    document.chunks.append(
-                        ChunkRecord(
-                            ordinal=part.ordinal,
-                            text=part.text,
-                            token_count=part.token_count,
-                            start_char=part.start_char,
-                            end_char=part.end_char,
-                            heading=part.heading,
-                            metadata_json=part.metadata or {},
-                        )
-                    )
         config = session.scalar(
             select(IndexConfiguration).where(IndexConfiguration.project_id == project.id)
         )
@@ -644,13 +909,69 @@ def _create_demo(state: AppState) -> dict[str, Any]:
             )
             session.add(config)
             session.flush()
-            RetrievalEngine(state.store, HashEmbeddingProvider()).index(
-                config.id, [(doc, chunk) for doc in project.documents for chunk in doc.chunks]
+            for document in project.documents:
+                for part in chunk_text(
+                    document.content,
+                    __import__("contextbench.schemas", fromlist=["ChunkingConfig"]).ChunkingConfig(
+                        strategy="PARAGRAPH"
+                    ),
+                ):
+                    config.chunks.append(
+                        ChunkRecord(
+                            document=document,
+                            ordinal=part.ordinal,
+                            text=part.text,
+                            token_count=part.token_count,
+                            start_char=part.start_char,
+                            end_char=part.end_char,
+                            heading=part.heading,
+                            metadata_json=part.metadata or {},
+                        )
+                    )
+            session.flush()
+            indexing_started = time.perf_counter()
+            config.vector_count = RetrievalEngine(state.store, HashEmbeddingProvider()).index(
+                config.id, [(chunk.document, chunk) for chunk in config.chunks]
             )
+            config.indexing_ms = (time.perf_counter() - indexing_started) * 1000
             config.status = "READY"
             config_reused = False
         else:
             config_reused = True
+        judgments = [
+            (
+                "What happens when a Raft follower falls behind the leader?",
+                "moves that follower's nextIndex backward",
+            ),
+            (
+                "Why must a database write the log before a dirty page?",
+                "log sequence number for a page change must be durable",
+            ),
+            (
+                "How does TCP keep a slow receiver from being overwhelmed?",
+                "TCP flow control protects the receiver",
+            ),
+        ]
+        for question, marker in judgments:
+            existing = session.scalar(
+                select(EvaluationQuery).where(
+                    EvaluationQuery.project_id == project.id,
+                    EvaluationQuery.query == question,
+                    EvaluationQuery.dataset_version == 1,
+                )
+            )
+            if existing is not None:
+                continue
+            relevant = next((chunk for chunk in config.chunks if marker in chunk.text), None)
+            if relevant is not None:
+                query = EvaluationQuery(
+                    project_id=project.id,
+                    query=question,
+                    notes="Deterministic built-in relevance judgment",
+                    dataset_version=1,
+                )
+                query.relevant_chunks = [RelevantChunk(chunk_id=relevant.id)]
+                session.add(query)
         return {
             "projectId": project.id,
             "indexConfigurationId": config.id,

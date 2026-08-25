@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -54,6 +54,9 @@ class ChunkRecord(Base):
     __tablename__ = "chunks"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
+    index_configuration_id: Mapped[str] = mapped_column(
+        ForeignKey("index_configurations.id"), index=True
+    )
     ordinal: Mapped[int] = mapped_column(Integer)
     text: Mapped[str] = mapped_column(Text)
     token_count: Mapped[int] = mapped_column(Integer)
@@ -62,6 +65,15 @@ class ChunkRecord(Base):
     heading: Mapped[str | None] = mapped_column(String(500), nullable=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     document: Mapped[Document] = relationship(back_populates="chunks")
+    index_configuration: Mapped[IndexConfiguration] = relationship(back_populates="chunks")
+    __table_args__ = (
+        UniqueConstraint(
+            "index_configuration_id",
+            "document_id",
+            "ordinal",
+            name="uq_chunk_index_document_ordinal",
+        ),
+    )
 
 
 class IndexConfiguration(Base):
@@ -73,8 +85,13 @@ class IndexConfiguration(Base):
     embedding_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     vector_dimension: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(30), default="CREATED")
+    vector_count: Mapped[int] = mapped_column(Integer, default=0)
+    indexing_ms: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     project: Mapped[Project] = relationship(back_populates="indexes")
+    chunks: Mapped[list[ChunkRecord]] = relationship(
+        back_populates="index_configuration", cascade="all, delete-orphan"
+    )
 
 
 class EvaluationQuery(Base):
@@ -82,6 +99,7 @@ class EvaluationQuery(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
     query: Mapped[str] = mapped_column(Text)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     dataset_version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     relevant_chunks: Mapped[list[RelevantChunk]] = relationship(cascade="all, delete-orphan")
